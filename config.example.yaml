@@ -47,6 +47,15 @@ live:
   max_open_positions: 3
   max_spread_pips: 2.0
 
+  # Phase 15 broker/account safety. When live.enabled=true, configure the exact
+  # MT5 login IDs that are allowed to receive orders. An empty allowlist fails.
+  allowed_account_logins: []
+  require_account_allowlist: true
+  # Projected margin after each new order must remain below 25% of equity, and
+  # projected free margin must remain at least 50% of equity.
+  max_margin_fraction_of_equity: 0.25
+  min_free_margin_fraction_after_order: 0.50
+
   # Phase 8 production-health gates.
   max_tick_age_seconds: 30
   # 0 = auto derive as 2.5 x configured timeframe duration.

@@ -48,6 +48,8 @@ class SymbolSpec:
     volume_max: float
     trade_allowed: bool
     filling_mode: int
+    trade_stops_level: int = 0
+    trade_freeze_level: int = 0
 
     @property
     def pip_size(self) -> float:
@@ -63,6 +65,44 @@ class SymbolSpec:
             return 0.0
         decimals = max(0, len(str(self.volume_step).split(".")[-1].rstrip("0"))) if "." in str(self.volume_step) else 0
         return round(normalized, decimals + 2)
+
+    def normalize_price(self, price: float) -> float:
+        if price <= 0 or self.tick_size <= 0:
+            raise ValueError("price and broker tick_size must be positive")
+        ticks = round(float(price) / self.tick_size)
+        return round(ticks * self.tick_size, self.digits)
+
+    @property
+    def minimum_protective_distance(self) -> float:
+        # Freeze level is included conservatively. Some brokers apply it mainly
+        # to modifications, but refusing a too-close initial protection level is
+        # safer than assuming it will remain modifiable immediately after fill.
+        return max(int(self.trade_stops_level), int(self.trade_freeze_level), 0) * self.point
+
+
+def normalize_and_validate_protective_prices(
+    spec: SymbolSpec,
+    side: int,
+    entry_price: float,
+    stop_loss: float,
+    take_profit: float,
+) -> tuple[float, float, float]:
+    if side not in (-1, 1):
+        raise ValueError("side must be -1 or 1")
+    entry = spec.normalize_price(entry_price)
+    stop = spec.normalize_price(stop_loss)
+    take = spec.normalize_price(take_profit)
+    if side > 0 and not (stop < entry < take):
+        raise ValueError("buy protection must satisfy stop_loss < entry < take_profit")
+    if side < 0 and not (take < entry < stop):
+        raise ValueError("sell protection must satisfy take_profit < entry < stop_loss")
+    minimum = spec.minimum_protective_distance
+    if minimum > 0:
+        if abs(entry - stop) + 1e-12 < minimum:
+            raise ValueError(f"stop-loss distance is below broker minimum {minimum}")
+        if abs(take - entry) + 1e-12 < minimum:
+            raise ValueError(f"take-profit distance is below broker minimum {minimum}")
+    return entry, stop, take
 
 
 @dataclass(frozen=True)
@@ -191,6 +231,8 @@ class MT5Broker:
             volume_max=float(info.volume_max),
             trade_allowed=trade_mode != disabled_mode,
             filling_mode=int(getattr(info, "filling_mode", 0)),
+            trade_stops_level=int(getattr(info, "trade_stops_level", 0) or 0),
+            trade_freeze_level=int(getattr(info, "trade_freeze_level", 0) or 0),
         )
 
     def current_tick(self, symbol: str) -> BrokerTick:
@@ -198,7 +240,11 @@ class MT5Broker:
         tick = mt5.symbol_info_tick(symbol)
         if tick is None:
             raise RuntimeError(f"missing tick for {symbol}: {mt5.last_error()}")
-        return BrokerTick(bid=float(tick.bid), ask=float(tick.ask), time_msc=int(getattr(tick, "time_msc", 0) or 0))
+        bid = float(tick.bid)
+        ask = float(tick.ask)
+        if bid <= 0 or ask <= 0 or ask < bid:
+            raise RuntimeError(f"invalid broker tick for {symbol}: bid={bid} ask={ask}")
+        return BrokerTick(bid=bid, ask=ask, time_msc=int(getattr(tick, "time_msc", 0) or 0))
 
     def account_snapshot(self) -> AccountSnapshot:
         info = mt5.account_info()
@@ -290,6 +336,52 @@ class MT5Broker:
             )
         return sorted(out, key=lambda item: (item.time_msc, item.ticket))
 
+    def _order_type(self, side: int) -> int:
+        if side == 1:
+            return int(mt5.ORDER_TYPE_BUY)
+        if side == -1:
+            return int(mt5.ORDER_TYPE_SELL)
+        raise ValueError("side must be -1 or 1")
+
+    def order_calc_profit(
+        self,
+        symbol: str,
+        side: int,
+        volume: float,
+        open_price: float,
+        close_price: float,
+    ) -> float:
+        if volume <= 0 or open_price <= 0 or close_price <= 0:
+            raise ValueError("volume and prices must be positive")
+        result = mt5.order_calc_profit(
+            self._order_type(side),
+            symbol,
+            float(volume),
+            float(open_price),
+            float(close_price),
+        )
+        if result is None:
+            raise RuntimeError(f"MT5 order_calc_profit failed for {symbol}: {mt5.last_error()}")
+        return float(result)
+
+    def loss_per_lot_to_stop(self, symbol: str, side: int, entry_price: float, stop_loss: float) -> float:
+        pnl = self.order_calc_profit(symbol, side, 1.0, entry_price, stop_loss)
+        loss = abs(float(pnl))
+        if loss <= 0:
+            raise RuntimeError("broker returned zero/non-positive loss to protective stop")
+        return loss
+
+    def order_calc_margin(self, symbol: str, side: int, volume: float, price: float) -> float:
+        if volume <= 0 or price <= 0:
+            raise ValueError("volume and price must be positive")
+        result = mt5.order_calc_margin(self._order_type(side), symbol, float(volume), float(price))
+        if result is None:
+            raise RuntimeError(f"MT5 order_calc_margin failed for {symbol}: {mt5.last_error()}")
+        margin = float(result)
+        if margin < 0:
+            raise RuntimeError("broker returned negative required margin")
+        return margin
+
     def _filling_candidates(self, preferred: int) -> list[int]:
         candidates: list[int] = []
         for value in (
@@ -345,7 +437,10 @@ class MT5Broker:
         tick = self.current_tick(order.symbol)
 
         is_buy = order.side == 1
-        price = tick.ask if is_buy else tick.bid
+        market_price = tick.ask if is_buy else tick.bid
+        price, stop_loss, take_profit = normalize_and_validate_protective_prices(
+            spec, order.side, market_price, order.stop_loss, order.take_profit
+        )
         order_type = mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
@@ -353,8 +448,8 @@ class MT5Broker:
             "volume": float(lots),
             "type": order_type,
             "price": float(price),
-            "sl": float(order.stop_loss),
-            "tp": float(order.take_profit),
+            "sl": float(stop_loss),
+            "tp": float(take_profit),
             "deviation": int(order.deviation_points),
             "magic": int(order.magic),
             "comment": str(order.comment)[:31],
@@ -369,7 +464,7 @@ class MT5Broker:
         tick = self.current_tick(position.symbol)
         close_side = -position.side
         is_buy = close_side == 1
-        price = tick.ask if is_buy else tick.bid
+        price = self.symbol_spec(position.symbol).normalize_price(tick.ask if is_buy else tick.bid)
         order_type = mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL
         request = {
             "action": mt5.TRADE_ACTION_DEAL,

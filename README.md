@@ -18,6 +18,8 @@ Personal automated-Forex research and execution framework with reproducible rese
 - Phase 11 can require an Ed25519-signed release before the Windows live supervisor starts or restarts.
 - Phase 12 can require a separately signed deterministic release bundle pinned to an expected commit and release ID.
 - Phase 13 never prunes a local backup unless a byte-identical verified replica is still reachable when pruning is attempted.
+- Phase 14 blocks live restarts when broker/local position history cannot be reconciled.
+- Phase 15 requires broker-native live risk/margin calculations and can pin execution to explicit MT5 account logins.
 - Research `PASS`, portfolio OOS, paper results, signed artifacts, backup health or clean operational checks do not guarantee profitability.
 
 ## Architecture
@@ -274,6 +276,30 @@ See `docs/phase12-release-bundle.md` for the artifact signing, verification and 
 
 See `docs/phase13-backup-retention.md` for the backup, retention, replication and restore-drill runbook.
 
+
+### Phase 14 — Broker State Disaster Recovery & Restart Reconciliation ✅
+
+- Read-only restart gate compares broker positions/deals with local live state and audit events
+- Atomic restart report/checkpoint and account/symbol/magic continuity checks
+- Same-millisecond broker deal ordering uses `(time_msc, ticket)`
+- Ambiguous restart state fails closed and never auto-repairs broker positions
+
+See `docs/phase14-restart-reconciliation.md` for the restart/recovery runbook.
+
+### Phase 15 — Broker-Accurate Position Sizing & Margin Safety ✅
+
+- Live risk sizing uses MT5 `order_calc_profit` for the actual symbol/account currency path
+- No tick-value approximation is used for new live position sizing
+- MT5 `order_calc_margin` gates every new order before `order_send`
+- Account-login allowlist is mandatory whenever `live.enabled=true` by default
+- Projected total-margin and free-margin fractions are capped before entry
+- Broker tick-size price normalization is applied to entry/SL/TP prices
+- Broker stops/freeze levels are enforced conservatively before order submission
+- Invalid/non-positive/crossed bid/ask ticks fail closed
+- Production health emits `ACCOUNT_LOGIN_NOT_ALLOWED` as CRITICAL
+
+See `docs/phase15-broker-safety.md` for account pinning, margin policy and broker-specific rollout steps.
+
 ## Quick start
 
 ```bash
@@ -285,6 +311,7 @@ copy config.example.yaml config.yaml
 copy production.example.yaml production.yaml
 copy watchdog.example.yaml watchdog.yaml
 copy backup.example.yaml backup.yaml
+copy reconcile.example.yaml reconcile.yaml
 ```
 
 List strategies:

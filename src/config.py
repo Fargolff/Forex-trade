@@ -25,6 +25,10 @@ class LiveConfig:
     max_total_lots: float = 0.05
     max_open_positions: int = 3
     max_spread_pips: float = 2.0
+    allowed_account_logins: tuple[int, ...] = ()
+    require_account_allowlist: bool = True
+    max_margin_fraction_of_equity: float = 0.25
+    min_free_margin_fraction_after_order: float = 0.50
     max_tick_age_seconds: float = 30.0
     # 0 = derive automatically from the configured timeframe in the CLI.
     max_bar_age_seconds: float = 0.0
@@ -92,7 +96,13 @@ def _paper(data: dict[str, Any]) -> PaperRuntimeConfig:
 
 
 def _live(data: dict[str, Any]) -> LiveConfig:
-    cfg = LiveConfig(**(data or {}))
+    raw = dict(data or {})
+    if "allowed_account_logins" in raw:
+        values = raw.get("allowed_account_logins") or []
+        if not isinstance(values, (list, tuple)):
+            raise ValueError("live.allowed_account_logins must be a list of MT5 login IDs")
+        raw["allowed_account_logins"] = tuple(int(value) for value in values)
+    cfg = LiveConfig(**raw)
     if cfg.poll_seconds < 1:
         raise ValueError("live.poll_seconds must be >= 1")
     if cfg.history_bars < 100:
@@ -111,6 +121,16 @@ def _live(data: dict[str, Any]) -> LiveConfig:
         raise ValueError("live.max_open_positions must be >= 1")
     if cfg.max_spread_pips <= 0:
         raise ValueError("live.max_spread_pips must be positive")
+    if any(login <= 0 for login in cfg.allowed_account_logins):
+        raise ValueError("live.allowed_account_logins must contain positive login IDs")
+    if len(set(cfg.allowed_account_logins)) != len(cfg.allowed_account_logins):
+        raise ValueError("live.allowed_account_logins cannot contain duplicates")
+    if cfg.enabled and cfg.require_account_allowlist and not cfg.allowed_account_logins:
+        raise ValueError("live.enabled requires at least one allowed_account_logins entry")
+    if not 0 < cfg.max_margin_fraction_of_equity < 1:
+        raise ValueError("live.max_margin_fraction_of_equity must be between 0 and 1")
+    if not 0 <= cfg.min_free_margin_fraction_after_order < 1:
+        raise ValueError("live.min_free_margin_fraction_after_order must be in [0,1)")
     if cfg.max_tick_age_seconds <= 0:
         raise ValueError("live.max_tick_age_seconds must be positive")
     if cfg.max_bar_age_seconds < 0:

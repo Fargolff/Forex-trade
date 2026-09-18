@@ -9,7 +9,7 @@ from typing import Any
 
 import pandas as pd
 
-from .mt5_broker import BrokerOrder, BrokerPosition, SymbolSpec
+from .mt5_broker import BrokerOrder, BrokerPosition, SymbolSpec, normalize_and_validate_protective_prices
 from .ops import (
     HeartbeatStore,
     Incident,
@@ -36,6 +36,10 @@ class LiveEngineConfig:
     max_total_lots: float = 0.05
     max_open_positions: int = 3
     max_spread_pips: float = 2.0
+    allowed_account_logins: tuple[int, ...] = ()
+    require_account_allowlist: bool = False
+    max_margin_fraction_of_equity: float = 0.25
+    min_free_margin_fraction_after_order: float = 0.50
     max_tick_age_seconds: float = 30.0
     max_bar_age_seconds: float = 7200.0
     deal_reconcile_lookback_hours: float = 72.0
@@ -142,6 +146,59 @@ def risk_sized_lots(
     return spec.normalize_volume(raw)
 
 
+def broker_risk_sized_lots(
+    broker: Any,
+    symbol: str,
+    equity: float,
+    risk_fraction: float,
+    strategy_weight: float,
+    entry_price: float,
+    stop_loss: float,
+    spec: SymbolSpec,
+    max_lot_per_order: float,
+) -> float:
+    if equity <= 0 or risk_fraction <= 0 or strategy_weight <= 0:
+        return 0.0
+    risk_cash = float(equity) * float(risk_fraction) * float(strategy_weight)
+    loss_per_lot = float(broker.loss_per_lot_to_stop(symbol, 1 if stop_loss < entry_price else -1, entry_price, stop_loss))
+    if loss_per_lot <= 0:
+        return 0.0
+    raw = min(risk_cash / loss_per_lot, float(max_lot_per_order))
+    return spec.normalize_volume(raw)
+
+
+def margin_safety_report(
+    broker: Any,
+    account: Any,
+    symbol: str,
+    side: int,
+    lots: float,
+    price: float,
+    cfg: LiveEngineConfig,
+) -> dict[str, Any]:
+    required = float(broker.order_calc_margin(symbol, side, lots, price))
+    equity = float(account.equity)
+    projected_margin = float(account.margin) + required
+    projected_free = float(account.margin_free) - required
+    margin_fraction = float("inf") if equity <= 0 else projected_margin / equity
+    free_fraction = float("-inf") if equity <= 0 else projected_free / equity
+    checks = {
+        "required_margin_nonnegative": required >= 0,
+        "projected_margin_within_cap": margin_fraction <= cfg.max_margin_fraction_of_equity + 1e-12,
+        "projected_free_margin_positive": projected_free > 0,
+        "projected_free_margin_fraction": free_fraction + 1e-12 >= cfg.min_free_margin_fraction_after_order,
+    }
+    return {
+        "ok": all(checks.values()),
+        "checks": checks,
+        "required_margin": required,
+        "projected_margin": projected_margin,
+        "projected_free_margin": projected_free,
+        "projected_margin_fraction": margin_fraction,
+        "projected_free_margin_fraction": free_fraction,
+    }
+
+
 def _strategy_name(position: BrokerPosition) -> str | None:
     if not position.comment.startswith(COMMENT_PREFIX):
         return None
@@ -156,11 +213,15 @@ def preflight_report(broker: Any, symbol: str, cfg: LiveEngineConfig, live_enabl
     managed = broker.open_positions(symbol=symbol, magic=cfg.magic)
     current_spread = spread_pips(tick, spec)
     total_lots = sum(float(p.volume) for p in managed)
+    account_allowed = (not cfg.require_account_allowlist) or (
+        bool(cfg.allowed_account_logins) and int(account.login) in set(cfg.allowed_account_logins)
+    )
     checks = {
         "config_live_enabled": bool(live_enabled),
         "terminal_connected": bool(terminal.connected),
         "terminal_trade_allowed": bool(terminal.trade_allowed),
         "hedging_account": bool(account.hedging),
+        "account_login_allowed": account_allowed,
         "symbol_trade_allowed": bool(spec.trade_allowed),
         "tick_value_available": spec.tick_size > 0 and spec.tick_value > 0,
         "spread_within_cap": current_spread <= cfg.max_spread_pips,
@@ -548,14 +609,40 @@ class LiveTradingEngine:
 
             stop_distance = float(row["stop_distance"])
             tp_distance = float(row["take_profit_distance"])
-            lots = risk_sized_lots(
-                account.equity,
-                self.config.risk_per_trade,
-                self.weights[strategy],
-                stop_distance,
-                spec,
-                self.config.max_lot_per_order,
-            )
+            tick = self.broker.current_tick(self.symbol)
+            market_price = tick.ask if side > 0 else tick.bid
+            raw_stop = market_price - side * stop_distance
+            raw_take = market_price + side * tp_distance
+            try:
+                market_price, stop_loss, take_profit = normalize_and_validate_protective_prices(
+                    spec, side, market_price, raw_stop, raw_take
+                )
+                lots = broker_risk_sized_lots(
+                    self.broker,
+                    self.symbol,
+                    account.equity,
+                    self.config.risk_per_trade,
+                    self.weights[strategy],
+                    market_price,
+                    stop_loss,
+                    spec,
+                    self.config.max_lot_per_order,
+                )
+            except Exception as exc:
+                self._log(
+                    "REJECT",
+                    ts,
+                    strategy=strategy,
+                    side=side,
+                    lots=0.0,
+                    price=market_price,
+                    stop_loss=raw_stop,
+                    take_profit=raw_take,
+                    spread_pips=current_spread,
+                    ticket="",
+                    reason=f"broker_risk_or_protection:{exc}",
+                )
+                continue
             if lots <= 0:
                 self._log(
                     "REJECT",
@@ -563,9 +650,9 @@ class LiveTradingEngine:
                     strategy=strategy,
                     side=side,
                     lots=0.0,
-                    price="",
-                    stop_loss="",
-                    take_profit="",
+                    price=market_price,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
                     spread_pips=current_spread,
                     ticket="",
                     reason="position_size_zero",
@@ -578,19 +665,50 @@ class LiveTradingEngine:
                     strategy=strategy,
                     side=side,
                     lots=lots,
-                    price="",
-                    stop_loss="",
-                    take_profit="",
+                    price=market_price,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
                     spread_pips=current_spread,
                     ticket="",
                     reason="total_lot_cap",
                 )
                 continue
+            try:
+                margin = margin_safety_report(
+                    self.broker, account, self.symbol, side, lots, market_price, self.config
+                )
+            except Exception as exc:
+                self._log(
+                    "REJECT",
+                    ts,
+                    strategy=strategy,
+                    side=side,
+                    lots=lots,
+                    price=market_price,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    spread_pips=current_spread,
+                    ticket="",
+                    reason=f"broker_margin_calc_failed:{exc}",
+                )
+                continue
+            if not margin["ok"]:
+                failed = ",".join(name for name, passed in margin["checks"].items() if not passed)
+                self._log(
+                    "REJECT",
+                    ts,
+                    strategy=strategy,
+                    side=side,
+                    lots=lots,
+                    price=market_price,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    spread_pips=current_spread,
+                    ticket="",
+                    reason=f"margin_gate:{failed};required={margin['required_margin']:.2f}",
+                )
+                continue
 
-            tick = self.broker.current_tick(self.symbol)
-            market_price = tick.ask if side > 0 else tick.bid
-            stop_loss = round(market_price - side * stop_distance, spec.digits)
-            take_profit = round(market_price + side * tp_distance, spec.digits)
             order = BrokerOrder(
                 symbol=self.symbol,
                 side=side,

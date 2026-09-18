@@ -370,6 +370,10 @@ def _live_engine_config(app_cfg: Any) -> LiveEngineConfig:
         max_total_lots=app_cfg.live.max_total_lots,
         max_open_positions=app_cfg.live.max_open_positions,
         max_spread_pips=app_cfg.live.max_spread_pips,
+        allowed_account_logins=tuple(app_cfg.live.allowed_account_logins),
+        require_account_allowlist=app_cfg.live.require_account_allowlist,
+        max_margin_fraction_of_equity=app_cfg.live.max_margin_fraction_of_equity,
+        min_free_margin_fraction_after_order=app_cfg.live.min_free_margin_fraction_after_order,
         max_tick_age_seconds=app_cfg.live.max_tick_age_seconds,
         max_bar_age_seconds=max_bar_age,
         deal_reconcile_lookback_hours=app_cfg.live.deal_reconcile_lookback_hours,
@@ -429,6 +433,16 @@ def production_guard_report(
     incidents: list[dict[str, str]] = [
         {"severity": item.severity, "code": item.code, "detail": item.detail} for item in ops["incidents"]
     ]
+    if live_cfg.require_account_allowlist and (
+        not live_cfg.allowed_account_logins or int(ops["account"].login) not in set(live_cfg.allowed_account_logins)
+    ):
+        incidents.append(
+            {
+                "severity": "CRITICAL",
+                "code": "ACCOUNT_LOGIN_NOT_ALLOWED",
+                "detail": f"MT5 login {ops['account'].login} is not in the configured live account allowlist",
+            }
+        )
     if future_seconds > prod_cfg.max_future_tick_seconds:
         incidents.append(
             {
