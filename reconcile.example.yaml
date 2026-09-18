@@ -1,0 +1,22 @@
+# Phase 14 broker/local restart reconciliation settings.
+# Copy to reconcile.yaml for production-specific overrides.
+
+# Search enough broker history to explain any currently open managed position.
+# If a position is older than this window the gate fails closed and requires
+# operator review instead of guessing its origin.
+lookback_hours: 2160
+
+# Atomic operator-readable outputs. These paths contain no broker credentials.
+report_path: runtime/restart_reconcile.json
+checkpoint_path: runtime/restart_checkpoint.json
+
+# Live event CSV rotation depth to inspect for ENTRY audit events.
+event_backups: 5
+
+# Floating-point lot comparison tolerance.
+volume_tolerance: 0.00000001
+
+# If true, every currently open broker-managed position must have a matching
+# local ENTRY event tied to its opening broker order/deal. This deliberately
+# catches a crash after broker execution but before local bookkeeping.
+require_local_entry: true
