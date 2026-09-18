@@ -1,0 +1,39 @@
+name: Phase 17 Apply
+
+on:
+  push:
+    branches:
+      - codex/phase11-signed-release-gate
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: codex/phase11-signed-release-gate
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Apply Phase 17 migration
+        run: python tools/phase17_apply.py
+
+      - name: Commit migration result
+        run: |
+          if git diff --quiet; then
+            echo "No Phase 17 changes to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src tests docs README.md
+          git commit -m "feat: add deterministic pending-intent recovery"
+          git push origin HEAD:codex/phase11-signed-release-gate
