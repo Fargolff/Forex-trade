@@ -38,6 +38,20 @@ if ($SignedBundleEnabled -and -not $SignedReleaseEnabled) {
     throw "FOREX_REQUIRE_SIGNED_BUNDLE requires FOREX_REQUIRE_SIGNED_RELEASE=1."
 }
 
+# Phase 14 broker/local restart reconciliation is fail-closed by default. A
+# temporary migration bypass requires the operator to explicitly set this to 0.
+$RestartReconcileRaw = [string]$env:FOREX_REQUIRE_RESTART_RECONCILE
+if ([string]::IsNullOrWhiteSpace($RestartReconcileRaw)) {
+    $RestartReconcileEnabled = $true
+} else {
+    $RestartReconcileEnabled = @("1", "true", "yes", "on") -contains $RestartReconcileRaw.ToLowerInvariant()
+}
+
+$ReconcileConfig = $env:FOREX_RECONCILE_CONFIG
+if ([string]::IsNullOrWhiteSpace($ReconcileConfig)) {
+    $ReconcileConfig = "reconcile.yaml"
+}
+
 function Test-SignedRelease {
     if (-not $SignedReleaseEnabled) {
         return
@@ -91,6 +105,22 @@ function Test-SignedBundle {
     }
 }
 
+function Test-RestartReconciliation {
+    if (-not $RestartReconcileEnabled) {
+        Write-Warning "Phase 14 restart reconciliation is explicitly disabled by FOREX_REQUIRE_RESTART_RECONCILE."
+        return
+    }
+
+    & $Python -m src.restart_reconcile `
+        --mode verify `
+        --config config.yaml `
+        --reconcile-config $ReconcileConfig
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Broker/local restart reconciliation failed. Supervised live will not start."
+    }
+}
+
 # Safety: this script never enables live trading and never stores the arming
 # phrase. Set FOREX_LIVE_ARM_PHRASE in the Windows user environment only after
 # config.yaml has been intentionally reviewed and live.enabled=true.
@@ -106,6 +136,7 @@ $Restarts = 0
 while ($Restarts -le $MaxRestarts) {
     Test-SignedBundle
     Test-SignedRelease
+    Test-RestartReconciliation
 
     & $Python -m src.production --mode supervised-live --arm-live $ArmPhrase
     $ExitCode = $LASTEXITCODE
