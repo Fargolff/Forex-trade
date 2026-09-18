@@ -557,3 +557,7 @@ Only then consider longer unattended operation
 ## Important
 
 This project is a research and execution framework, not a guarantee of profit. Leveraged FX/CFD trading can lose money quickly. Spread, slippage, commission, swap, gaps, broker execution, leverage, model error, operational failure and regime change can materially alter live results versus research and paper trading.
+
+## Phase 16 — Order Execution & Partial-Fill Reconciliation
+
+Live order submission now uses normalized execution receipts (`FILLED`, `PARTIAL`, `PLACED`) and explicit rejection vs ambiguous-submission exceptions. A persistent `pending_order_intent` is written to `live_state.json` before every entry/close/flatten submission and is cleared only after a fully confirmed fill and durable audit event. Partial fills, accepted-but-unconfirmed orders, missing submission results, fill-volume mismatches, and unexpected execution exceptions halt new trading without automatic resend or auto-repair. A leftover intent after restart is itself a CRITICAL fail-closed condition and requires broker-state reconciliation before manual clearance.

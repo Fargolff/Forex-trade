@@ -9,7 +9,15 @@ from typing import Any
 
 import pandas as pd
 
-from .mt5_broker import BrokerOrder, BrokerPosition, SymbolSpec, normalize_and_validate_protective_prices
+from .mt5_broker import (
+    BrokerOrder,
+    BrokerOrderRejected,
+    BrokerPosition,
+    BrokerSubmissionAmbiguous,
+    ExecutionReceipt,
+    SymbolSpec,
+    normalize_and_validate_protective_prices,
+)
 from .ops import (
     HeartbeatStore,
     Incident,
@@ -53,13 +61,14 @@ class LiveEngineConfig:
 
 @dataclass
 class LiveState:
-    version: int = 2
+    version: int = 3
     peak_equity: float = 0.0
     start_of_day_equity: float = 0.0
     current_day: str | None = None
     last_bar_time: str | None = None
     last_deal_time_msc: int = 0
     last_incident_fingerprint: str | None = None
+    pending_order_intent: dict[str, Any] | None = None
     halted: bool = False
     halt_reason: str | None = None
 
@@ -199,6 +208,22 @@ def margin_safety_report(
     }
 
 
+def execution_receipt_issue(
+    receipt: ExecutionReceipt,
+    requested_volume: float,
+    volume_tolerance: float,
+) -> str | None:
+    if receipt.status == "PARTIAL":
+        return "PARTIAL_FILL"
+    if receipt.status == "PLACED":
+        return "ORDER_ACCEPTED_UNCONFIRMED"
+    if receipt.status != "FILLED":
+        return "ORDER_STATUS_UNKNOWN"
+    if abs(float(receipt.filled_volume) - float(requested_volume)) > max(float(volume_tolerance), 1e-12):
+        return "FILL_VOLUME_MISMATCH"
+    return None
+
+
 def _strategy_name(position: BrokerPosition) -> str | None:
     if not position.comment.startswith(COMMENT_PREFIX):
         return None
@@ -286,6 +311,53 @@ class LiveTradingEngine:
             max_daily_loss_pct=config.max_daily_loss_pct,
             max_drawdown_pct=config.max_drawdown_pct,
         )
+
+    def _persist_order_intent(
+        self,
+        ts: pd.Timestamp | datetime,
+        *,
+        action: str,
+        strategy: str,
+        side: int,
+        lots: float,
+        stop_loss: float = 0.0,
+        take_profit: float = 0.0,
+        position_ticket: int = 0,
+    ) -> dict[str, Any]:
+        intent = {
+            "action": action,
+            "strategy": strategy,
+            "symbol": self.symbol,
+            "side": int(side),
+            "lots": float(lots),
+            "stop_loss": float(stop_loss),
+            "take_profit": float(take_profit),
+            "position_ticket": int(position_ticket),
+            "bar_time": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
+        }
+        self.state.pending_order_intent = intent
+        self.store.save(self.state)
+        return intent
+
+    def _clear_order_intent(self) -> None:
+        self.state.pending_order_intent = None
+        self.store.save(self.state)
+
+    def _execution_fail_closed(
+        self,
+        ts: pd.Timestamp | datetime,
+        code: str,
+        detail: str,
+        *,
+        strategy: str = "",
+        ticket: int = 0,
+    ) -> None:
+        incident = Incident(code=code, severity="CRITICAL", detail=detail, strategy=strategy, ticket=ticket)
+        self._record_incidents([incident], ts)
+        if not self.state.halted:
+            self._halt_for_ops(pd.Timestamp(ts), [incident])
+        else:
+            self.store.save(self.state)
 
     def _managed_positions(self) -> list[BrokerPosition]:
         return self.broker.open_positions(symbol=self.symbol, magic=self.config.magic)
@@ -396,25 +468,60 @@ class LiveTradingEngine:
         closed: list[int] = []
         now = datetime.now(timezone.utc)
         for position in list(self._managed_positions()):
-            self.broker.close_position(
-                position,
-                deviation_points=self.config.deviation_points,
-                live_enabled=self.live_enabled,
+            strategy = _strategy_name(position) or ""
+            self._persist_order_intent(
+                now, action="FLATTEN", strategy=strategy, side=-position.side,
+                lots=position.volume, position_ticket=position.ticket,
             )
+            try:
+                receipt = self.broker.close_position(
+                    position,
+                    deviation_points=self.config.deviation_points,
+                    live_enabled=self.live_enabled,
+                )
+            except BrokerOrderRejected as exc:
+                self._clear_order_intent()
+                self._execution_fail_closed(
+                    now, "EMERGENCY_CLOSE_REJECTED", str(exc), strategy=strategy, ticket=position.ticket
+                )
+                raise
+            except BrokerSubmissionAmbiguous as exc:
+                self._execution_fail_closed(
+                    now, "EMERGENCY_CLOSE_AMBIGUOUS", str(exc), strategy=strategy, ticket=position.ticket
+                )
+                raise
+            except Exception as exc:
+                self._execution_fail_closed(
+                    now, "EMERGENCY_CLOSE_EXCEPTION", str(exc), strategy=strategy, ticket=position.ticket
+                )
+                raise
+
+            issue = execution_receipt_issue(
+                receipt, position.volume, max(self.broker.symbol_spec(position.symbol).volume_step / 2.0, 1e-12)
+            )
+            if issue:
+                self._execution_fail_closed(
+                    now, issue,
+                    f"emergency close status={receipt.status}; requested={position.volume}; filled={receipt.filled_volume}",
+                    strategy=strategy, ticket=receipt.ticket or position.ticket,
+                )
+                raise RuntimeError(f"emergency flatten not fully confirmed: {issue}")
+
             closed.append(position.ticket)
             self._log(
                 "FLATTEN",
                 now,
-                strategy=_strategy_name(position) or "",
+                strategy=strategy,
                 side=position.side,
-                lots=position.volume,
-                price="",
+                lots=receipt.filled_volume,
+                price=receipt.price or "",
                 stop_loss=position.stop_loss,
                 take_profit=position.take_profit,
                 spread_pips="",
-                ticket=position.ticket,
-                reason=reason,
+                ticket=receipt.ticket or position.ticket,
+                reason=f"{reason};deal={receipt.deal}",
             )
+            self._clear_order_intent()
         return closed
 
     def _halt_and_flatten(self, ts: pd.Timestamp, reason: str) -> None:
@@ -472,6 +579,26 @@ class LiveTradingEngine:
         report = self._operational_report(ts)
         self._record_incidents(report["incidents"], ts)
         self._reconcile_deals(ts)
+
+        if self.state.pending_order_intent is not None:
+            pending = self.state.pending_order_intent
+            incident = Incident(
+                code="PENDING_ORDER_INTENT",
+                severity="CRITICAL",
+                detail=(
+                    f"unresolved {pending.get('action', 'ORDER')} intent for "
+                    f"{pending.get('strategy', '')} lots={pending.get('lots', '')}; "
+                    "inspect broker positions/deals before clearing the intent"
+                ),
+                strategy=str(pending.get("strategy", "")),
+                ticket=int(pending.get("position_ticket", 0) or 0),
+            )
+            self._record_incidents([incident], ts)
+            if not self.state.halted:
+                self._halt_for_ops(ts, [incident])
+            self.store.save(self.state)
+            self._write_heartbeat(report, status="HALTED")
+            return self.snapshot()
 
         critical = [item for item in report["incidents"] if item.severity == "CRITICAL"]
         if critical and not self.state.halted:
@@ -555,26 +682,74 @@ class LiveTradingEngine:
             if existing is not None and existing.side == side:
                 continue
             if existing is not None and existing.side != side:
-                self.broker.close_position(
-                    existing,
-                    deviation_points=self.config.deviation_points,
-                    live_enabled=self.live_enabled,
+                self._persist_order_intent(
+                    ts,
+                    action="CLOSE",
+                    strategy=strategy,
+                    side=-existing.side,
+                    lots=existing.volume,
+                    position_ticket=existing.ticket,
                 )
-                total_lots = max(0.0, total_lots - existing.volume)
-                open_count = max(0, open_count - 1)
+                try:
+                    close_receipt = self.broker.close_position(
+                        existing,
+                        deviation_points=self.config.deviation_points,
+                        live_enabled=self.live_enabled,
+                    )
+                except BrokerOrderRejected as exc:
+                    self._clear_order_intent()
+                    self._log(
+                        "CLOSE_REJECT", ts, strategy=strategy, side=existing.side, lots=existing.volume,
+                        price="", stop_loss=existing.stop_loss, take_profit=existing.take_profit,
+                        spread_pips=current_spread, ticket=existing.ticket, reason=str(exc),
+                    )
+                    continue
+                except BrokerSubmissionAmbiguous as exc:
+                    self._execution_fail_closed(
+                        ts, "CLOSE_SUBMISSION_AMBIGUOUS", str(exc), strategy=strategy, ticket=existing.ticket
+                    )
+                    self._write_heartbeat(report, status="HALTED")
+                    return self.snapshot()
+                except Exception as exc:
+                    self._execution_fail_closed(
+                        ts, "CLOSE_EXECUTION_EXCEPTION", str(exc), strategy=strategy, ticket=existing.ticket
+                    )
+                    self._write_heartbeat(report, status="HALTED")
+                    return self.snapshot()
+
+                close_issue = execution_receipt_issue(
+                    close_receipt, existing.volume, max(spec.volume_step / 2.0, 1e-12)
+                )
+                if close_issue:
+                    self._execution_fail_closed(
+                        ts,
+                        close_issue,
+                        (
+                            f"close status={close_receipt.status}; requested={existing.volume}; "
+                            f"filled={close_receipt.filled_volume}; order={close_receipt.order}; deal={close_receipt.deal}"
+                        ),
+                        strategy=strategy,
+                        ticket=close_receipt.ticket or existing.ticket,
+                    )
+                    self._write_heartbeat(report, status="HALTED")
+                    return self.snapshot()
+
                 self._log(
                     "CLOSE",
                     ts,
                     strategy=strategy,
                     side=existing.side,
-                    lots=existing.volume,
-                    price="",
+                    lots=close_receipt.filled_volume,
+                    price=close_receipt.price or "",
                     stop_loss=existing.stop_loss,
                     take_profit=existing.take_profit,
                     spread_pips=current_spread,
-                    ticket=existing.ticket,
-                    reason="opposite_signal",
+                    ticket=close_receipt.ticket or existing.ticket,
+                    reason=f"opposite_signal;deal={close_receipt.deal}",
                 )
+                self._clear_order_intent()
+                total_lots = max(0.0, total_lots - close_receipt.filled_volume)
+                open_count = max(0, open_count - 1)
 
             if current_spread > self.config.max_spread_pips:
                 self._log(
@@ -719,22 +894,71 @@ class LiveTradingEngine:
                 deviation_points=self.config.deviation_points,
                 comment=f"{COMMENT_PREFIX}{strategy}"[:31],
             )
-            result = self.broker.market_order(order, live_enabled=self.live_enabled)
-            ticket = int(getattr(result, "order", 0) or getattr(result, "deal", 0) or 0)
+            self._persist_order_intent(
+                ts,
+                action="ENTRY",
+                strategy=strategy,
+                side=side,
+                lots=lots,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+            )
+            try:
+                receipt = self.broker.market_order(order, live_enabled=self.live_enabled)
+            except BrokerOrderRejected as exc:
+                self._clear_order_intent()
+                self._log(
+                    "REJECT", ts, strategy=strategy, side=side, lots=lots, price=market_price,
+                    stop_loss=stop_loss, take_profit=take_profit, spread_pips=current_spread,
+                    ticket="", reason=f"broker_reject:{exc}",
+                )
+                continue
+            except BrokerSubmissionAmbiguous as exc:
+                self._execution_fail_closed(
+                    ts, "ORDER_SUBMISSION_AMBIGUOUS", str(exc), strategy=strategy
+                )
+                self._write_heartbeat(report, status="HALTED")
+                return self.snapshot()
+            except Exception as exc:
+                self._execution_fail_closed(
+                    ts, "ORDER_EXECUTION_EXCEPTION", str(exc), strategy=strategy
+                )
+                self._write_heartbeat(report, status="HALTED")
+                return self.snapshot()
+
+            issue = execution_receipt_issue(receipt, lots, max(spec.volume_step / 2.0, 1e-12))
+            if issue:
+                self._execution_fail_closed(
+                    ts,
+                    issue,
+                    (
+                        f"entry status={receipt.status}; requested={lots}; filled={receipt.filled_volume}; "
+                        f"order={receipt.order}; deal={receipt.deal}"
+                    ),
+                    strategy=strategy,
+                    ticket=receipt.ticket,
+                )
+                self._write_heartbeat(report, status="HALTED")
+                return self.snapshot()
+
             self._log(
                 "ENTRY",
                 ts,
                 strategy=strategy,
                 side=side,
-                lots=lots,
-                price=market_price,
+                lots=receipt.filled_volume,
+                price=receipt.price or market_price,
                 stop_loss=stop_loss,
                 take_profit=take_profit,
                 spread_pips=current_spread,
-                ticket=ticket,
-                reason="latest_completed_bar_signal",
+                ticket=receipt.ticket,
+                reason=f"latest_completed_bar_signal;deal={receipt.deal};retcode={receipt.retcode}",
             )
-            total_lots += lots
+            # Clear only after the durable ENTRY audit row exists. If the process
+            # dies after broker submission but before here, restart sees the
+            # pending intent and refuses to resend.
+            self._clear_order_intent()
+            total_lots += receipt.filled_volume
             open_count += 1
 
         self.state.last_bar_time = ts.isoformat()

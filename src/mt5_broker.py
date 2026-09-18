@@ -163,6 +163,30 @@ class BrokerDeal:
     entry: int
 
 
+class BrokerOrderRejected(RuntimeError):
+    """Broker explicitly rejected an order before/at submission."""
+
+
+class BrokerSubmissionAmbiguous(RuntimeError):
+    """Submission outcome is unknown; callers must reconcile before retrying."""
+
+
+@dataclass(frozen=True)
+class ExecutionReceipt:
+    retcode: int
+    status: str
+    order: int
+    deal: int
+    requested_volume: float
+    filled_volume: float
+    price: float
+    comment: str
+
+    @property
+    def ticket(self) -> int:
+        return self.order or self.deal
+
+
 class MT5Broker:
     def __init__(self) -> None:
         if mt5 is None:
@@ -404,24 +428,47 @@ class MT5Broker:
                 return candidate
             if checked is not None:
                 last_error = f"retcode={getattr(checked, 'retcode', None)} comment={getattr(checked, 'comment', '')}"
-        raise RuntimeError(f"MT5 order_check rejected all filling modes: {last_error or mt5.last_error()}")
+        raise BrokerOrderRejected(f"MT5 order_check rejected all filling modes: {last_error or mt5.last_error()}")
 
-    def _send_checked(self, request: dict[str, Any], preferred_filling: int):
+    def _send_checked(self, request: dict[str, Any], preferred_filling: int) -> ExecutionReceipt:
         checked_request = self._checked_request(request, preferred_filling)
         result = mt5.order_send(checked_request)
         if result is None:
-            raise RuntimeError(f"MT5 order_send returned None: {mt5.last_error()}")
-        success_codes = {
-            int(getattr(mt5, "TRADE_RETCODE_DONE", 10009)),
-            int(getattr(mt5, "TRADE_RETCODE_DONE_PARTIAL", 10010)),
-            int(getattr(mt5, "TRADE_RETCODE_PLACED", 10008)),
-        }
-        if int(getattr(result, "retcode", -1)) not in success_codes:
-            raise RuntimeError(
-                f"MT5 order_send failed: retcode={getattr(result, 'retcode', None)} "
-                f"comment={getattr(result, 'comment', '')}"
+            # None does not prove that the broker never received the request.
+            # Never resend automatically after this point.
+            raise BrokerSubmissionAmbiguous(f"MT5 order_send returned None: {mt5.last_error()}")
+
+        retcode = int(getattr(result, "retcode", -1))
+        done = int(getattr(mt5, "TRADE_RETCODE_DONE", 10009))
+        partial = int(getattr(mt5, "TRADE_RETCODE_DONE_PARTIAL", 10010))
+        placed = int(getattr(mt5, "TRADE_RETCODE_PLACED", 10008))
+        if retcode == done:
+            status = "FILLED"
+        elif retcode == partial:
+            status = "PARTIAL"
+        elif retcode == placed:
+            status = "PLACED"
+        else:
+            raise BrokerOrderRejected(
+                f"MT5 order_send failed: retcode={retcode} comment={getattr(result, 'comment', '')}"
             )
-        return result
+
+        requested_volume = float(checked_request.get("volume", 0.0) or 0.0)
+        filled_volume = float(getattr(result, "volume", 0.0) or 0.0)
+        # DONE is broker confirmation of completion. Some gateways omit the
+        # echoed volume, so only for DONE may the checked request volume be used.
+        if status == "FILLED" and filled_volume <= 0:
+            filled_volume = requested_volume
+        return ExecutionReceipt(
+            retcode=retcode,
+            status=status,
+            order=int(getattr(result, "order", 0) or 0),
+            deal=int(getattr(result, "deal", 0) or 0),
+            requested_volume=requested_volume,
+            filled_volume=filled_volume,
+            price=float(getattr(result, "price", 0.0) or 0.0),
+            comment=str(getattr(result, "comment", "") or ""),
+        )
 
     def market_order(self, order: BrokerOrder, live_enabled: bool = False):
         if not live_enabled:
