@@ -1,6 +1,6 @@
 # Forex Auto Trader Research Framework
 
-Personal automated-Forex research and execution framework with reproducible research, cost-aware backtests, robust validation, portfolio controls, paper-forward testing, guarded MT5 live execution, production supervision, an independent watchdog, disaster-recovery tooling and cryptographically signed deployment releases.
+Personal automated-Forex research and execution framework with reproducible research, cost-aware backtests, robust validation, portfolio controls, paper-forward testing, guarded MT5 live execution, production supervision, an independent watchdog, disaster-recovery tooling, cryptographically signed releases and deterministic signed deployment bundles.
 
 ## Safety defaults
 
@@ -16,7 +16,8 @@ Personal automated-Forex research and execution framework with reproducible rese
 - Phase 9 adds a persistent production halt that survives process/Windows restarts.
 - Phase 10 watchdog/recovery tools have **no broker-order path**.
 - Phase 11 can require an Ed25519-signed release before the Windows live supervisor starts or restarts.
-- Research `PASS`, portfolio OOS, paper results, signed releases or clean health checks do not guarantee profitability.
+- Phase 12 can require a separately signed deterministic release bundle pinned to an expected commit and release ID.
+- Research `PASS`, portfolio OOS, paper results, signed artifacts or clean health checks do not guarantee profitability.
 
 ## Architecture
 
@@ -34,6 +35,8 @@ MT5 Paper Forward
 Guarded Live Engine
       ↓
 Broker Reconciliation + Runtime Health
+      ↓
+Signed Release Bundle Verification
       ↓
 Signed Release Verification
       ↓
@@ -53,13 +56,15 @@ Forex-trade/
 ├─ docs/
 │  ├─ phase9-production.md
 │  ├─ phase10-watchdog-recovery.md
-│  └─ phase11-signed-release.md
+│  ├─ phase11-signed-release.md
+│  └─ phase12-release-bundle.md
 ├─ deploy/windows/
 │  ├─ run-live-supervisor.ps1
 │  ├─ install-scheduled-task.ps1
 │  ├─ run-watchdog.ps1
 │  └─ install-watchdog-task.ps1
 ├─ src/
+│  ├─ artifact.py
 │  ├─ backtest.py
 │  ├─ config.py
 │  ├─ data.py
@@ -227,6 +232,22 @@ See `docs/phase10-watchdog-recovery.md` for the disaster-recovery procedure.
 
 See `docs/phase11-signed-release.md` for the signing and key-rotation runbook.
 
+### Phase 12 — Deterministic Signed Release Bundle & Provenance ✅
+
+- Deterministic ZIP packaging of the exact Phase 11 verified deployment tree
+- Detached Ed25519 signature over the complete bundle bytes
+- Bundle metadata includes source commit and release ID inside the signed ZIP
+- External trusted public key remains the trust anchor; embedded key is cross-checked only
+- Strict member allowlist, duplicate-member rejection and ZIP-slip/path-traversal rejection
+- Anti-rollback pinning using expected source commit + expected release ID
+- Bundle manifest/signature can be bound to the deployed Phase 11 manifest/signature
+- Verify-before-extract preview workflow; no automatic in-place installer
+- Opt-in Windows supervisor gate via `FOREX_REQUIRE_SIGNED_BUNDLE=1`
+- Phase 12 supervisor gate requires Phase 11 gate to remain enabled
+- Security tests cover deterministic builds, tampering, hidden files, wrong keys, rollback pins, deployed binding and unsafe archive paths
+
+See `docs/phase12-release-bundle.md` for the artifact signing, verification and rollback runbook.
+
 ## Quick start
 
 ```bash
@@ -360,6 +381,43 @@ python -m src.release --mode verify --root . --manifest release/release_manifest
 
 After key setup and a successful manual verification, enable the Windows supervisor gate with `FOREX_REQUIRE_SIGNED_RELEASE=1`. The private key should not be present on the trading machine.
 
+## Phase 12 signed release bundle
+
+Build the deterministic bundle from an already verified Phase 11 tree:
+
+```bash
+python -m src.artifact --mode build \
+  --root . \
+  --manifest release/release_manifest.json \
+  --release-signature release/release_signature.json \
+  --public-key release/forex-release-public.pem \
+  --archive release/forex-release-bundle.zip \
+  --source-commit <GIT_COMMIT_SHA> \
+  --release-id <UNIQUE_RELEASE_ID>
+```
+
+Sign the complete ZIP on the protected/offline signing machine:
+
+```bash
+python -m src.artifact --mode sign \
+  --archive release/forex-release-bundle.zip \
+  --bundle-signature release/forex-release-bundle.signature.json \
+  --private-key <OFFLINE_PRIVATE_KEY_PATH>
+```
+
+Verify with the externally trusted public key and anti-rollback pins:
+
+```bash
+python -m src.artifact --mode verify \
+  --archive release/forex-release-bundle.zip \
+  --bundle-signature release/forex-release-bundle.signature.json \
+  --public-key release/forex-release-public.pem \
+  --expected-commit <GIT_COMMIT_SHA> \
+  --expected-release-id <UNIQUE_RELEASE_ID>
+```
+
+After manual verification, Phase 12 can be enabled with `FOREX_REQUIRE_SIGNED_BUNDLE=1`. It requires Phase 11's gate plus `FOREX_EXPECTED_RELEASE_COMMIT` and `FOREX_EXPECTED_RELEASE_ID`.
+
 ## Operational soak
 
 ```bash
@@ -391,7 +449,13 @@ Create deployment manifest
       ↓
 Sign manifest with protected/offline key
       ↓
-Verify signature + deployment hashes on trading machine
+Verify Phase 11 release
+      ↓
+Build deterministic release bundle with commit + release ID
+      ↓
+Sign complete bundle with protected/offline key
+      ↓
+Verify bundle + anti-rollback pins + deployed binding
       ↓
 One explicitly armed tiny live cycle
       ↓
