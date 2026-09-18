@@ -1,0 +1,37 @@
+# Phase 9 production observability settings.
+# Copy this file to production.yaml before supervised deployment.
+# Secrets are intentionally NOT stored here. If webhook delivery is wanted,
+# set the environment variable named by alert_webhook_env.
+
+alert_webhook_env: FOREX_ALERT_WEBHOOK_URL
+alert_outbox_path: runtime/alerts.jsonl
+alert_state_path: runtime/alert_state.json
+alert_timeout_seconds: 5.0
+alert_cooldown_seconds: 900.0
+
+metrics_path: runtime/execution_metrics.json
+production_halt_path: runtime/production_halt.json
+
+max_log_bytes: 5000000
+log_backups: 5
+
+# Dynamic execution baselines. Before min_samples is reached the values are
+# collected but no z-score anomaly is emitted.
+spread_min_samples: 30
+spread_z_limit: 4.0
+slippage_min_samples: 20
+slippage_z_limit: 4.0
+max_observed_slippage_pips: 2.0
+
+# Reject obviously impossible/future broker timestamps rather than trusting
+# a machine/broker clock mismatch.
+max_future_tick_seconds: 5.0
+
+# Conservative account stress using current managed positions at their stops
+# plus one additional risk budget. These are operational gates, not guarantees.
+min_stressed_margin_level_pct: 300.0
+min_stressed_free_margin_pct: 0.25
+additional_risk_fraction: 0.0025
+
+reconnect_attempts: 3
+reconnect_backoff_seconds: 5.0

@@ -1,0 +1,29 @@
+# Phase 10 independent watchdog settings.
+# Copy to watchdog.yaml on the watchdog machine/process.
+# The watchdog does not connect to MT5 and never sends trading orders.
+
+# Local/UNC/shared-path mode. If FOREX_HEARTBEAT_URL is set, the URL source
+# takes precedence and this path becomes a fallback configuration value.
+heartbeat_path: runtime/live_heartbeat.json
+production_halt_path: runtime/production_halt.json
+state_path: runtime/watchdog_state.json
+
+# Remote source and secrets are environment-variable only.
+heartbeat_url_env: FOREX_HEARTBEAT_URL
+heartbeat_bearer_env: FOREX_HEARTBEAT_BEARER
+alert_webhook_env: FOREX_WATCHDOG_WEBHOOK_URL
+alert_bearer_env: FOREX_WATCHDOG_WEBHOOK_BEARER
+
+alert_outbox_path: runtime/watchdog_alerts.jsonl
+alert_state_path: runtime/watchdog_alert_state.json
+request_timeout_seconds: 5.0
+alert_cooldown_seconds: 900.0
+
+# A missing/stale heartbeat is CRITICAL. Tune this above the live daemon's
+# normal heartbeat/poll cadence, not below it.
+max_heartbeat_age_seconds: 120.0
+max_future_seconds: 10.0
+poll_seconds: 30.0
+
+max_log_bytes: 5000000
+log_backups: 5

@@ -1,0 +1,65 @@
+mode: backtest
+symbol: EURUSD
+timeframe: H1
+data_dir: data
+
+initial_equity: 10000
+risk_per_trade: 0.005
+max_daily_loss_pct: 0.02
+max_drawdown_pct: 0.10
+
+# Cost assumptions must be realistic for your broker/account type.
+spread_pips: 0.8
+slippage_pips: 0.2
+commission_per_lot_round_turn: 7.0
+
+strategy:
+  name: ema_trend
+  params:
+    fast: 20
+    slow: 50
+    atr_period: 14
+    stop_atr: 2.0
+    take_profit_atr: 3.0
+
+# Phase 6 paper trading consumes the Phase 5 portfolio files.
+# MT5 is used only for market data; no real order is sent.
+paper:
+  state_path: runtime/paper_state.json
+  events_path: runtime/paper_events.csv
+  weights_path: results/portfolio/portfolio_weights.csv
+  candidates_path: results/portfolio/portfolio_candidates.csv
+  poll_seconds: 30
+  history_bars: 5000
+
+# Phase 7/8 live execution is intentionally disabled by default.
+# Enabling this flag is still not enough to trade: the CLI also requires the
+# explicit operator arming phrase. Live mode supports MT5 hedging accounts only.
+live:
+  enabled: false
+  magic: 56001
+  deviation_points: 20
+  risk_per_trade: 0.0025
+  max_daily_loss_pct: 0.01
+  max_drawdown_pct: 0.05
+  max_lot_per_order: 0.02
+  max_total_lots: 0.05
+  max_open_positions: 3
+  max_spread_pips: 2.0
+
+  # Phase 8 production-health gates.
+  max_tick_age_seconds: 30
+  # 0 = auto derive as 2.5 x configured timeframe duration.
+  max_bar_age_seconds: 0
+  deal_reconcile_lookback_hours: 72
+  max_reconnect_attempts: 3
+  reconnect_backoff_seconds: 5
+
+  state_path: runtime/live_state.json
+  events_path: runtime/live_events.csv
+  heartbeat_path: runtime/live_heartbeat.json
+  incidents_path: runtime/live_incidents.csv
+  weights_path: results/portfolio/portfolio_weights.csv
+  candidates_path: results/portfolio/portfolio_candidates.csv
+  poll_seconds: 30
+  history_bars: 5000
