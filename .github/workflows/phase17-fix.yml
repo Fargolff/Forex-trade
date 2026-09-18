@@ -49,6 +49,6 @@ jobs:
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src/restart_reconcile.py tests/test_phase17_pending_intent.py
+          git add src/restart_reconcile.py src/ops.py tests/test_phase16_execution.py tests/test_phase17_pending_intent.py
           git commit -m "fix: validate deterministic pending-intent recovery"
           git push origin HEAD:codex/phase11-signed-release-gate
