@@ -109,6 +109,12 @@ def _live_config(cfg, args) -> LiveEngineConfig:
         min_free_margin_fraction_after_order=cfg.live.min_free_margin_fraction_after_order,
         max_tick_age_seconds=cfg.live.max_tick_age_seconds,
         max_bar_age_seconds=max_bar_age,
+        market_session_enabled=cfg.live.market_session_enabled,
+        market_sunday_open_utc=cfg.live.market_sunday_open_utc,
+        market_friday_close_utc=cfg.live.market_friday_close_utc,
+        market_transition_grace_seconds=cfg.live.market_transition_grace_seconds,
+        max_future_tick_seconds=cfg.live.max_future_tick_seconds,
+        max_future_bar_seconds=cfg.live.max_future_bar_seconds,
         deal_reconcile_lookback_hours=cfg.live.deal_reconcile_lookback_hours,
         magic=cfg.live.magic,
         deviation_points=cfg.live.deviation_points,
@@ -225,6 +231,11 @@ def _print_operational_report(report: dict) -> None:
     print(f"Spread                 : {report['spread_pips']:.2f} pips")
     print(f"Tick age               : {report['tick_age_seconds']:.1f}s")
     print(f"Completed-bar age      : {report['bar_age_seconds']:.1f}s")
+    print(f"Market state           : {report.get('market_state', 'UNKNOWN')}")
+    print(f"Market reason          : {report.get('market_reason', '')}")
+    print(f"Next transition UTC    : {report.get('next_market_transition_utc')}")
+    print(f"Tick clock offset      : {report.get('tick_clock_offset_seconds')}s")
+    print(f"Bar clock offset       : {report.get('bar_clock_offset_seconds')}s")
     print(f"Managed positions      : {len(report['positions'])}")
     print(f"Account equity         : {report['account'].equity:.2f} {report['account'].currency}")
     if report["incidents"]:
@@ -408,6 +419,12 @@ def main() -> None:
                 completed.index[-1],
                 max_tick_age_seconds=live_cfg.max_tick_age_seconds,
                 max_bar_age_seconds=live_cfg.max_bar_age_seconds,
+                market_session_enabled=live_cfg.market_session_enabled,
+                market_sunday_open_utc=live_cfg.market_sunday_open_utc,
+                market_friday_close_utc=live_cfg.market_friday_close_utc,
+                market_transition_grace_seconds=live_cfg.market_transition_grace_seconds,
+                max_future_tick_seconds=live_cfg.max_future_tick_seconds,
+                max_future_bar_seconds=live_cfg.max_future_bar_seconds,
             )
             _print_operational_report(report)
         finally:

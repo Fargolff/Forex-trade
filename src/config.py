@@ -32,6 +32,12 @@ class LiveConfig:
     max_tick_age_seconds: float = 30.0
     # 0 = derive automatically from the configured timeframe in the CLI.
     max_bar_age_seconds: float = 0.0
+    market_session_enabled: bool = True
+    market_sunday_open_utc: str = "22:00"
+    market_friday_close_utc: str = "22:00"
+    market_transition_grace_seconds: float = 3600.0
+    max_future_tick_seconds: float = 5.0
+    max_future_bar_seconds: float = 300.0
     deal_reconcile_lookback_hours: float = 72.0
     max_reconnect_attempts: int = 3
     reconnect_backoff_seconds: float = 5.0
@@ -95,6 +101,14 @@ def _paper(data: dict[str, Any]) -> PaperRuntimeConfig:
     return cfg
 
 
+def _valid_hhmm(value: str) -> bool:
+    parts = str(value).split(":")
+    if len(parts) != 2 or not all(part.isdigit() for part in parts):
+        return False
+    hour, minute = (int(part) for part in parts)
+    return 0 <= hour <= 23 and 0 <= minute <= 59 and len(parts[0]) == 2 and len(parts[1]) == 2
+
+
 def _live(data: dict[str, Any]) -> LiveConfig:
     raw = dict(data or {})
     if "allowed_account_logins" in raw:
@@ -135,6 +149,14 @@ def _live(data: dict[str, Any]) -> LiveConfig:
         raise ValueError("live.max_tick_age_seconds must be positive")
     if cfg.max_bar_age_seconds < 0:
         raise ValueError("live.max_bar_age_seconds cannot be negative")
+    if not _valid_hhmm(cfg.market_sunday_open_utc):
+        raise ValueError("live.market_sunday_open_utc must be HH:MM UTC")
+    if not _valid_hhmm(cfg.market_friday_close_utc):
+        raise ValueError("live.market_friday_close_utc must be HH:MM UTC")
+    if cfg.market_transition_grace_seconds < 0:
+        raise ValueError("live.market_transition_grace_seconds cannot be negative")
+    if cfg.max_future_tick_seconds < 0 or cfg.max_future_bar_seconds < 0:
+        raise ValueError("live future timestamp tolerances cannot be negative")
     if cfg.deal_reconcile_lookback_hours <= 0:
         raise ValueError("live.deal_reconcile_lookback_hours must be positive")
     if cfg.max_reconnect_attempts < 0:

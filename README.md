@@ -572,3 +572,10 @@ Phase 17 turns the Phase 16 pending-order journal into a deterministic restart r
 `PHASE18_WORKING_ORDER_RECOVERY`
 
 Phase 18 tracks MT5 active/history orders by exact broker order ticket, persists receipt evidence before interpreting `PLACED`, prevents resends while an order is still working, detects orphan managed orders, and can auto-clear only a broker-proven terminal **no-fill** outcome. Partial/mismatched/missing evidence remains fail-closed. See `docs/phase18-working-order-recovery.md`.
+
+
+## Phase 19 market-session and clock safety
+
+Guarded live now distinguishes `OPEN`, `CLOSED`, and `TRANSITION` FX weekly-session states. Weekend/boundary closure suppresses stale tick/bar alerts but blocks new order creation; position integrity, pending-intent reconciliation, terminal health, and future-timestamp checks continue to run. `live-health` and heartbeat output include the market state, next transition, and broker-data clock offsets.
+
+See `docs/phase19-market-clock.md` before changing the broker-specific UTC session boundaries.

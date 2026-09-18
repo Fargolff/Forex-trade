@@ -60,6 +60,16 @@ live:
   max_tick_age_seconds: 30
   # 0 = auto derive as 2.5 x configured timeframe duration.
   max_bar_age_seconds: 0
+
+  # Phase 19 FX weekly-session and timestamp safety. The one-hour transition
+  # window absorbs common DST/broker boundary shifts and blocks new entries.
+  market_session_enabled: true
+  market_sunday_open_utc: "22:00"
+  market_friday_close_utc: "22:00"
+  market_transition_grace_seconds: 3600
+  max_future_tick_seconds: 5
+  max_future_bar_seconds: 300
+
   deal_reconcile_lookback_hours: 72
   max_reconnect_attempts: 3
   reconnect_backoff_seconds: 5

@@ -51,6 +51,12 @@ class LiveEngineConfig:
     min_free_margin_fraction_after_order: float = 0.50
     max_tick_age_seconds: float = 30.0
     max_bar_age_seconds: float = 7200.0
+    market_session_enabled: bool = True
+    market_sunday_open_utc: str = "22:00"
+    market_friday_close_utc: str = "22:00"
+    market_transition_grace_seconds: float = 3600.0
+    max_future_tick_seconds: float = 5.0
+    max_future_bar_seconds: float = 300.0
     deal_reconcile_lookback_hours: float = 72.0
     magic: int = 56001
     deviation_points: int = 20
@@ -428,6 +434,12 @@ class LiveTradingEngine:
             ts,
             max_tick_age_seconds=self.config.max_tick_age_seconds,
             max_bar_age_seconds=self.config.max_bar_age_seconds,
+            market_session_enabled=self.config.market_session_enabled,
+            market_sunday_open_utc=self.config.market_sunday_open_utc,
+            market_friday_close_utc=self.config.market_friday_close_utc,
+            market_transition_grace_seconds=self.config.market_transition_grace_seconds,
+            max_future_tick_seconds=self.config.max_future_tick_seconds,
+            max_future_bar_seconds=self.config.max_future_bar_seconds,
         )
 
     def _write_heartbeat(self, report: dict[str, Any], status: str | None = None) -> None:
@@ -442,6 +454,12 @@ class LiveTradingEngine:
                 spread_pips=report["spread_pips"],
                 tick_age_seconds_value=report["tick_age_seconds"],
                 bar_age_seconds_value=report["bar_age_seconds"],
+                market_state=report.get("market_state"),
+                market_reason=report.get("market_reason"),
+                next_market_transition_utc=report.get("next_market_transition_utc"),
+                staleness_suppressed=bool(report.get("staleness_suppressed", False)),
+                tick_clock_offset_seconds_value=report.get("tick_clock_offset_seconds"),
+                bar_clock_offset_seconds_value=report.get("bar_clock_offset_seconds"),
                 last_deal_time_msc=self.state.last_deal_time_msc,
                 last_deal_ticket=self.state.last_deal_ticket,
             )
@@ -646,6 +664,14 @@ class LiveTradingEngine:
         if self.state.halted:
             self.store.save(self.state)
             self._write_heartbeat(report, status="HALTED")
+            return self.snapshot()
+
+        if report.get("market_state", "OPEN") != "OPEN":
+            # Weekend / configured boundary windows are not feed failures, but
+            # they are also not permitted entry windows. Keep last_bar_time
+            # unchanged so a fresh completed bar is required after reopening.
+            self.store.save(self.state)
+            self._write_heartbeat(report, status="OK")
             return self.snapshot()
 
         warnings = [item for item in report["incidents"] if item.severity == "WARN"]
