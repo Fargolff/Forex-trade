@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Local trading/runtime state
+config.yaml
+production.yaml
+watchdog.yaml
+runtime/
+backups/
+results/
+data/
+
+# Secrets / local environment
+.env
+.env.*
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
