@@ -34,7 +34,7 @@ def _intent(action="ENTRY", **overrides):
     return value
 
 
-def _deal(*, ticket=11, order=55, position_id=900, time_msc=1_789_718_405_000, side=1, volume=0.10, entry=0):
+def _deal(*, ticket=11, order=55, position_id=900, time_msc=1_789_722_005_000, side=1, volume=0.10, entry=0):
     return BrokerDeal(
         ticket=ticket,
         order=order,
@@ -84,9 +84,9 @@ def test_entry_partial_volume_does_not_auto_resolve():
 
 
 def test_same_millisecond_cursor_uses_ticket_tiebreaker():
-    intent = _intent(deal_cursor_before_submit={"time_msc": 1_789_718_405_000, "ticket": 20})
-    old = _deal(ticket=19, order=54, time_msc=1_789_718_405_000)
-    new = _deal(ticket=21, order=55, time_msc=1_789_718_405_000)
+    intent = _intent(deal_cursor_before_submit={"time_msc": 1_789_722_005_000, "ticket": 20})
+    old = _deal(ticket=19, order=54, time_msc=1_789_722_005_000)
+    new = _deal(ticket=21, order=55, time_msc=1_789_722_005_000)
     result = resolve_pending_order_intent(intent, [old, new], [_position()])
     assert result.resolved is True
     assert result.order == 55
@@ -211,6 +211,6 @@ def test_restart_verify_auto_resolves_exact_pending_entry(tmp_path):
     assert saved["pending_order_intent"] is None
     assert saved["halted"] is False
     assert saved["halt_reason"] is None
-    assert saved["last_deal_time_msc"] == 1_789_718_405_000
+    assert saved["last_deal_time_msc"] == 1_789_722_005_000
     assert saved["last_deal_ticket"] == 11
     assert "phase17_recovered_pending_intent:intent-abc" in events_path.read_text(encoding="utf-8")

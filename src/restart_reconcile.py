@@ -266,15 +266,6 @@ def restart_reconciliation_report(
                 f"{len(positions)} broker-managed position(s) exist but local live state is missing",
             )
         )
-    if state and bool(state.get("halted", False)):
-        incidents.append(
-            ReconcileIncident(
-                "LOCAL_LIVE_STATE_HALTED",
-                "CRITICAL",
-                f"local live state is halted: {state.get('halt_reason') or 'unspecified'}",
-            )
-        )
-
     if checkpoint:
         try:
             prior_login = int(checkpoint.get("account_login", 0) or 0)

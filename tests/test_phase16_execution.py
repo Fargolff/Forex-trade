@@ -130,7 +130,7 @@ def test_pending_order_intent_round_trips_atomically(tmp_path):
     store.save(state)
 
     loaded = store.load()
-    assert loaded.version == 3
+    assert loaded.version == 4
     assert loaded.pending_order_intent is not None
     assert loaded.pending_order_intent["action"] == "ENTRY"
     assert loaded.pending_order_intent["lots"] == pytest.approx(0.10)

@@ -232,11 +232,16 @@ def recent_managed_deals(
     else:
         start = current - timedelta(hours=lookback_hours)
     deals = broker.history_deals(start, current, symbol=symbol, magic=magic)
-    cursor = (int(after_time_msc), int(after_ticket))
-    return sorted(
-        [deal for deal in deals if (int(deal.time_msc), int(deal.ticket)) > cursor],
-        key=lambda item: (int(item.time_msc), int(item.ticket)),
-    )
+    if int(after_ticket) > 0:
+        cursor = (int(after_time_msc), int(after_ticket))
+        selected = [deal for deal in deals if (int(deal.time_msc), int(deal.ticket)) > cursor]
+    else:
+        # Backward compatibility: callers that only provide the historical
+        # time_msc cursor expect all deals at that exact millisecond to be
+        # considered already consumed. Phase 17 uses the full tuple whenever
+        # last_deal_ticket is available.
+        selected = [deal for deal in deals if int(deal.time_msc) > int(after_time_msc)]
+    return sorted(selected, key=lambda item: (int(item.time_msc), int(item.ticket)))
 
 
 def deal_totals(deals: Iterable[BrokerDeal]) -> dict[str, float | int]:
