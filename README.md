@@ -1,6 +1,6 @@
 # Forex Auto Trader Research Framework
 
-Personal automated-Forex research and execution framework with reproducible research, cost-aware backtests, robust validation, portfolio controls, paper-forward testing, guarded MT5 live execution, production supervision, an independent watchdog, disaster-recovery tooling, cryptographically signed releases and deterministic signed deployment bundles.
+Personal automated-Forex research and execution framework with reproducible research, cost-aware backtests, robust validation, portfolio controls, paper-forward testing, guarded MT5 live execution, production supervision, an independent watchdog, disaster-recovery tooling, cryptographically signed releases, deterministic signed deployment bundles and verified off-device backup retention.
 
 ## Safety defaults
 
@@ -17,7 +17,8 @@ Personal automated-Forex research and execution framework with reproducible rese
 - Phase 10 watchdog/recovery tools have **no broker-order path**.
 - Phase 11 can require an Ed25519-signed release before the Windows live supervisor starts or restarts.
 - Phase 12 can require a separately signed deterministic release bundle pinned to an expected commit and release ID.
-- Research `PASS`, portfolio OOS, paper results, signed artifacts or clean health checks do not guarantee profitability.
+- Phase 13 never prunes a local backup unless a byte-identical verified replica is still reachable when pruning is attempted.
+- Research `PASS`, portfolio OOS, paper results, signed artifacts, backup health or clean operational checks do not guarantee profitability.
 
 ## Architecture
 
@@ -43,6 +44,8 @@ Signed Release Verification
 Production Supervisor
       ↓
 External Watchdog + Disaster Recovery
+      ↓
+Verified Backup + Off-device Replication
 ```
 
 Key files:
@@ -52,19 +55,24 @@ Forex-trade/
 ├─ config.example.yaml
 ├─ production.example.yaml
 ├─ watchdog.example.yaml
+├─ backup.example.yaml
 ├─ requirements.txt
 ├─ docs/
 │  ├─ phase9-production.md
 │  ├─ phase10-watchdog-recovery.md
 │  ├─ phase11-signed-release.md
-│  └─ phase12-release-bundle.md
+│  ├─ phase12-release-bundle.md
+│  └─ phase13-backup-retention.md
 ├─ deploy/windows/
 │  ├─ run-live-supervisor.ps1
 │  ├─ install-scheduled-task.ps1
 │  ├─ run-watchdog.ps1
-│  └─ install-watchdog-task.ps1
+│  ├─ install-watchdog-task.ps1
+│  ├─ run-backup-cycle.ps1
+│  └─ install-backup-task.ps1
 ├─ src/
 │  ├─ artifact.py
+│  ├─ backup_policy.py
 │  ├─ backtest.py
 │  ├─ config.py
 │  ├─ data.py
@@ -248,6 +256,24 @@ See `docs/phase11-signed-release.md` for the signing and key-rotation runbook.
 
 See `docs/phase12-release-bundle.md` for the artifact signing, verification and rollback runbook.
 
+### Phase 13 — Backup Retention & Off-device Replication ✅
+
+- Atomic backup catalog with archive SHA-256 and replica metadata
+- Immediate verification after every managed backup creation
+- Filesystem-based off-device replication to external drive, UNC/network share or approved sync folder
+- Temporary-copy → atomic rename for replica publication
+- Replica archive verification plus byte-identical SHA-256 comparison
+- Conservative latest/daily/weekly/monthly retention buckets
+- Local pruning blocked unless a verified byte-identical replica is reachable
+- Explicit acknowledgement required before destructive retention deletion
+- Non-production restore drill with post-restore size/SHA-256 verification
+- Atomic restore-drill report
+- Windows daily backup Task Scheduler template
+- Scheduled retention deletion remains opt-in
+- No cloud/provider credentials are stored in the repository
+
+See `docs/phase13-backup-retention.md` for the backup, retention, replication and restore-drill runbook.
+
 ## Quick start
 
 ```bash
@@ -258,6 +284,7 @@ pip install -r requirements.txt
 copy config.example.yaml config.yaml
 copy production.example.yaml production.yaml
 copy watchdog.example.yaml watchdog.yaml
+copy backup.example.yaml backup.yaml
 ```
 
 List strategies:
@@ -369,6 +396,29 @@ python -m src.recovery --mode make-manifest
 python -m src.recovery --mode verify-manifest
 ```
 
+## Phase 13 managed backup lifecycle
+
+Set an off-device root through the environment, then run a verified cycle:
+
+```bash
+python -m src.backup_policy --mode cycle --root . --config backup.yaml
+```
+
+Review retention without deleting anything:
+
+```bash
+python -m src.backup_policy --mode retention-plan --config backup.yaml
+python -m src.backup_policy --mode prune --config backup.yaml
+```
+
+Run a non-production restore drill:
+
+```bash
+python -m src.backup_policy --mode restore-drill --config backup.yaml
+```
+
+A scheduled Windows backup refuses to run if `FOREX_BACKUP_REPLICA_ROOT` is missing. Destructive retention remains disabled unless the operator explicitly enables it and supplies the prune acknowledgement.
+
 ## Signed release verification
 
 Create a deployment manifest, sign it on the trusted signing machine, then verify it on the trading machine:
@@ -443,7 +493,9 @@ Production health + baseline collection
       ↓
 Independent watchdog running
       ↓
-Backup + restore-preview drill
+Verified local backup + off-device replica
+      ↓
+Restore drill
       ↓
 Create deployment manifest
       ↓
@@ -472,7 +524,6 @@ Only then consider longer unattended operation
 - Hosted heartbeat transport with authenticated publishing/acknowledgement
 - Broker-specific swap/financing forecasting and reconciliation policy
 - Broker holiday/weekend calendar semantics
-- Automated backup retention/off-device replication policy
 - Restore-state reconciliation against every broker-side edge case
 - Multi-day broker-specific soak across reconnects, weekend closes and DST/time changes
 
