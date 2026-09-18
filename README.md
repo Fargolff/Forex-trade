@@ -579,3 +579,8 @@ Phase 18 tracks MT5 active/history orders by exact broker order ticket, persists
 Guarded live now distinguishes `OPEN`, `CLOSED`, and `TRANSITION` FX weekly-session states. Weekend/boundary closure suppresses stale tick/bar alerts but blocks new order creation; position integrity, pending-intent reconciliation, terminal health, and future-timestamp checks continue to run. `live-health` and heartbeat output include the market state, next transition, and broker-data clock offsets.
 
 See `docs/phase19-market-clock.md` before changing the broker-specific UTC session boundaries.
+
+
+## Phase 20 — Broker session calibration
+
+Phase 20 persists conservative broker timing evidence in `runtime/session_calibration.json`. After enough independent weekly samples, the effective Sunday open may move later and the effective Friday close may move earlier, but calibration can never expand beyond the static Phase 19 envelope. A rolling moving-tick offset watchdog halts new trading on persistent broker/host time disagreement. See `docs/phase20-session-calibration.md`.

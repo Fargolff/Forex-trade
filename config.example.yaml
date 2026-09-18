@@ -70,6 +70,18 @@ live:
   max_future_tick_seconds: 5
   max_future_bar_seconds: 300
 
+  # Phase 20 conservative broker-session calibration. Learned evidence may only
+  # narrow the Phase 19 static session; it can never expand trading hours.
+  session_calibration_enabled: true
+  session_calibration_state_path: runtime/session_calibration.json
+  session_calibration_min_samples: 3
+  session_calibration_safety_buffer_minutes: 15
+  session_calibration_max_narrowing_minutes: 180
+  session_calibration_retention_weeks: 12
+  clock_watchdog_window_size: 12
+  clock_watchdog_min_samples: 5
+  max_persistent_clock_offset_seconds: 60
+
   deal_reconcile_lookback_hours: 72
   max_reconnect_attempts: 3
   reconnect_backoff_seconds: 5

@@ -19,6 +19,14 @@ from .mt5_broker import (
     SymbolSpec,
     normalize_and_validate_protective_prices,
 )
+from .market_clock import WeeklyFxSessionPolicy
+from .session_calibration import (
+    SessionCalibrationConfig,
+    SessionCalibrationStore,
+    clock_watchdog_status,
+    effective_session_policy,
+    observe_market_timing,
+)
 from .ops import (
     HeartbeatStore,
     Incident,
@@ -57,6 +65,15 @@ class LiveEngineConfig:
     market_transition_grace_seconds: float = 3600.0
     max_future_tick_seconds: float = 5.0
     max_future_bar_seconds: float = 300.0
+    session_calibration_enabled: bool = True
+    session_calibration_state_path: str = "runtime/session_calibration.json"
+    session_calibration_min_samples: int = 3
+    session_calibration_safety_buffer_minutes: int = 15
+    session_calibration_max_narrowing_minutes: int = 180
+    session_calibration_retention_weeks: int = 12
+    clock_watchdog_window_size: int = 12
+    clock_watchdog_min_samples: int = 5
+    max_persistent_clock_offset_seconds: float = 60.0
     deal_reconcile_lookback_hours: float = 72.0
     magic: int = 56001
     deviation_points: int = 20
@@ -313,6 +330,19 @@ class LiveTradingEngine:
         self.events = LiveEventLog(config.events_path)
         self.incidents = IncidentLog(config.incidents_path)
         self.heartbeat = HeartbeatStore(config.heartbeat_path)
+        self.session_calibration_config = SessionCalibrationConfig(
+            enabled=config.session_calibration_enabled,
+            state_path=config.session_calibration_state_path,
+            min_boundary_samples=config.session_calibration_min_samples,
+            safety_buffer_minutes=config.session_calibration_safety_buffer_minutes,
+            max_narrowing_minutes=config.session_calibration_max_narrowing_minutes,
+            sample_retention_weeks=config.session_calibration_retention_weeks,
+            clock_window_size=config.clock_watchdog_window_size,
+            clock_min_samples=config.clock_watchdog_min_samples,
+            max_persistent_clock_offset_seconds=config.max_persistent_clock_offset_seconds,
+        )
+        self.session_calibration_store = SessionCalibrationStore(config.session_calibration_state_path)
+        self.session_calibration_state = self.session_calibration_store.load()
         self.state = self.store.load()
         self.limits = RiskLimits(
             risk_per_trade=config.risk_per_trade,
@@ -426,7 +456,27 @@ class LiveTradingEngine:
             )
 
     def _operational_report(self, ts: pd.Timestamp) -> dict[str, Any]:
-        return operational_report(
+        static_policy = WeeklyFxSessionPolicy(
+            enabled=self.config.market_session_enabled,
+            sunday_open_utc=self.config.market_sunday_open_utc,
+            friday_close_utc=self.config.market_friday_close_utc,
+            transition_grace_seconds=self.config.market_transition_grace_seconds,
+            max_future_tick_seconds=self.config.max_future_tick_seconds,
+            max_future_bar_seconds=self.config.max_future_bar_seconds,
+        )
+        observed_tick = self.broker.current_tick(self.symbol)
+        observe_market_timing(
+            self.session_calibration_state,
+            tick_time_msc=observed_tick.time_msc,
+            static_policy=static_policy,
+            config=self.session_calibration_config,
+        )
+        self.session_calibration_store.save(self.session_calibration_state)
+        policy, calibration = effective_session_policy(
+            static_policy, self.session_calibration_state, self.session_calibration_config
+        )
+        clock_watchdog = clock_watchdog_status(self.session_calibration_state, self.session_calibration_config)
+        report = operational_report(
             self.broker,
             self.symbol,
             self.config.magic,
@@ -434,17 +484,30 @@ class LiveTradingEngine:
             ts,
             max_tick_age_seconds=self.config.max_tick_age_seconds,
             max_bar_age_seconds=self.config.max_bar_age_seconds,
-            market_session_enabled=self.config.market_session_enabled,
-            market_sunday_open_utc=self.config.market_sunday_open_utc,
-            market_friday_close_utc=self.config.market_friday_close_utc,
-            market_transition_grace_seconds=self.config.market_transition_grace_seconds,
-            max_future_tick_seconds=self.config.max_future_tick_seconds,
-            max_future_bar_seconds=self.config.max_future_bar_seconds,
+            market_session_enabled=policy.enabled,
+            market_sunday_open_utc=policy.sunday_open_utc,
+            market_friday_close_utc=policy.friday_close_utc,
+            market_transition_grace_seconds=policy.transition_grace_seconds,
+            max_future_tick_seconds=policy.max_future_tick_seconds,
+            max_future_bar_seconds=policy.max_future_bar_seconds,
         )
+        if clock_watchdog["violation"]:
+            report["incidents"].append(
+                Incident(
+                    "PERSISTENT_BROKER_TIME_OFFSET",
+                    "CRITICAL",
+                    f"rolling broker/host offset median {float(clock_watchdog['median_offset_seconds']):.1f}s "
+                    f"exceeds {float(clock_watchdog['threshold_seconds']):.1f}s; investigate OS clock or feed latency",
+                )
+            )
+            report["status"] = "CRITICAL"
+            report["ok"] = False
+        report["session_calibration"] = calibration
+        report["clock_watchdog"] = clock_watchdog
+        return report
 
     def _write_heartbeat(self, report: dict[str, Any], status: str | None = None) -> None:
-        self.heartbeat.write(
-            heartbeat_payload(
+        payload = heartbeat_payload(
                 status=status or report["status"],
                 symbol=self.symbol,
                 last_bar_time=self.state.last_bar_time,
@@ -463,7 +526,9 @@ class LiveTradingEngine:
                 last_deal_time_msc=self.state.last_deal_time_msc,
                 last_deal_ticket=self.state.last_deal_ticket,
             )
-        )
+        payload["session_calibration"] = report.get("session_calibration")
+        payload["clock_watchdog"] = report.get("clock_watchdog")
+        self.heartbeat.write(payload)
 
     def _reconcile_deals(self, ts: pd.Timestamp | datetime) -> dict[str, float | int]:
         deals = recent_managed_deals(
