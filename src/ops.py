@@ -222,6 +222,7 @@ def recent_managed_deals(
     magic: int,
     *,
     after_time_msc: int = 0,
+    after_ticket: int = 0,
     lookback_hours: float = 48.0,
     now: datetime | None = None,
 ) -> list[BrokerDeal]:
@@ -231,7 +232,11 @@ def recent_managed_deals(
     else:
         start = current - timedelta(hours=lookback_hours)
     deals = broker.history_deals(start, current, symbol=symbol, magic=magic)
-    return [deal for deal in deals if deal.time_msc > after_time_msc]
+    cursor = (int(after_time_msc), int(after_ticket))
+    return sorted(
+        [deal for deal in deals if (int(deal.time_msc), int(deal.ticket)) > cursor],
+        key=lambda item: (int(item.time_msc), int(item.ticket)),
+    )
 
 
 def deal_totals(deals: Iterable[BrokerDeal]) -> dict[str, float | int]:
@@ -256,6 +261,7 @@ def heartbeat_payload(
     tick_age_seconds_value: float | None = None,
     bar_age_seconds_value: float | None = None,
     last_deal_time_msc: int = 0,
+    last_deal_ticket: int = 0,
 ) -> dict[str, Any]:
     pos = list(positions)
     return {
@@ -264,6 +270,7 @@ def heartbeat_payload(
         "symbol": symbol,
         "last_bar_time": last_bar_time,
         "last_deal_time_msc": int(last_deal_time_msc),
+        "last_deal_ticket": int(last_deal_ticket),
         "account": {
             "login": int(account.login),
             "currency": str(account.currency),

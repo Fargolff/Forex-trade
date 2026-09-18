@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import csv
 import json
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -61,12 +62,13 @@ class LiveEngineConfig:
 
 @dataclass
 class LiveState:
-    version: int = 3
+    version: int = 4
     peak_equity: float = 0.0
     start_of_day_equity: float = 0.0
     current_day: str | None = None
     last_bar_time: str | None = None
     last_deal_time_msc: int = 0
+    last_deal_ticket: int = 0
     last_incident_fingerprint: str | None = None
     pending_order_intent: dict[str, Any] | None = None
     halted: bool = False
@@ -323,8 +325,16 @@ class LiveTradingEngine:
         stop_loss: float = 0.0,
         take_profit: float = 0.0,
         position_ticket: int = 0,
+        position_id: int = 0,
     ) -> dict[str, Any]:
         intent = {
+            "version": 2,
+            "intent_id": uuid.uuid4().hex,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "deal_cursor_before_submit": {
+                "time_msc": int(self.state.last_deal_time_msc),
+                "ticket": int(self.state.last_deal_ticket),
+            },
             "action": action,
             "strategy": strategy,
             "symbol": self.symbol,
@@ -333,6 +343,7 @@ class LiveTradingEngine:
             "stop_loss": float(stop_loss),
             "take_profit": float(take_profit),
             "position_ticket": int(position_ticket),
+            "position_id": int(position_id or position_ticket),
             "bar_time": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
         }
         self.state.pending_order_intent = intent
@@ -414,6 +425,7 @@ class LiveTradingEngine:
                 tick_age_seconds_value=report["tick_age_seconds"],
                 bar_age_seconds_value=report["bar_age_seconds"],
                 last_deal_time_msc=self.state.last_deal_time_msc,
+                last_deal_ticket=self.state.last_deal_ticket,
             )
         )
 
@@ -423,6 +435,7 @@ class LiveTradingEngine:
             self.symbol,
             self.config.magic,
             after_time_msc=self.state.last_deal_time_msc,
+            after_ticket=self.state.last_deal_ticket,
             lookback_hours=self.config.deal_reconcile_lookback_hours,
         )
         for deal in deals:
@@ -444,7 +457,9 @@ class LiveTradingEngine:
                 ),
             )
         if deals:
-            self.state.last_deal_time_msc = max(item.time_msc for item in deals)
+            latest = max((int(item.time_msc), int(item.ticket)) for item in deals)
+            self.state.last_deal_time_msc = latest[0]
+            self.state.last_deal_ticket = latest[1]
         return deal_totals(deals)
 
     def _risk_gate(self, ts: pd.Timestamp) -> tuple[bool, str | None]:
@@ -472,6 +487,7 @@ class LiveTradingEngine:
             self._persist_order_intent(
                 now, action="FLATTEN", strategy=strategy, side=-position.side,
                 lots=position.volume, position_ticket=position.ticket,
+                position_id=int(getattr(position, "identifier", 0) or position.ticket),
             )
             try:
                 receipt = self.broker.close_position(
@@ -689,6 +705,7 @@ class LiveTradingEngine:
                     side=-existing.side,
                     lots=existing.volume,
                     position_ticket=existing.ticket,
+                    position_id=int(getattr(existing, "identifier", 0) or existing.ticket),
                 )
                 try:
                     close_receipt = self.broker.close_position(
@@ -984,6 +1001,8 @@ class LiveTradingEngine:
             "halt_reason": self.state.halt_reason,
             "last_bar_time": self.state.last_bar_time,
             "last_deal_time_msc": self.state.last_deal_time_msc,
+            "last_deal_ticket": self.state.last_deal_ticket,
+            "pending_order_intent_id": (self.state.pending_order_intent or {}).get("intent_id"),
             "managed_positions": len(managed),
             "managed_total_lots": sum(float(p.volume) for p in managed),
             "heartbeat_path": self.config.heartbeat_path,

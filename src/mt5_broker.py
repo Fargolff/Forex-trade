@@ -143,6 +143,7 @@ class BrokerPosition:
     take_profit: float
     magic: int
     comment: str
+    identifier: int = 0
 
 
 @dataclass(frozen=True)
@@ -313,6 +314,7 @@ class MT5Broker:
                     take_profit=float(getattr(pos, "tp", 0.0) or 0.0),
                     magic=pos_magic,
                     comment=str(getattr(pos, "comment", "") or ""),
+                    identifier=int(getattr(pos, "identifier", 0) or getattr(pos, "ticket", 0) or 0),
                 )
             )
         return out

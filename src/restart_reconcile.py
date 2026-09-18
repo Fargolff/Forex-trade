@@ -13,6 +13,11 @@ import yaml
 from .config import load_config
 from .mt5_broker import BrokerDeal, BrokerPosition, MT5Broker
 from .paper import load_portfolio_bundle
+from .pending_intent import (
+    append_recovered_event,
+    execution_halt_reason_resolvable,
+    resolve_pending_order_intent,
+)
 from .production import atomic_write_json
 
 
@@ -292,11 +297,13 @@ def restart_reconciliation_report(
 
     checkpoint_cursor = _checkpoint_cursor(checkpoint)
     state_cursor_msc = 0
+    state_cursor_ticket = 0
     if state:
         try:
             state_cursor_msc = int(state.get("last_deal_time_msc", 0) or 0)
+            state_cursor_ticket = int(state.get("last_deal_ticket", 0) or 0)
         except (TypeError, ValueError):
-            incidents.append(ReconcileIncident("LOCAL_STATE_DEAL_CURSOR_INVALID", "CRITICAL", "last_deal_time_msc is invalid"))
+            incidents.append(ReconcileIncident("LOCAL_STATE_DEAL_CURSOR_INVALID", "CRITICAL", "last deal cursor is invalid"))
 
     cursor_msc = max(state_cursor_msc, checkpoint_cursor[0])
     if cursor_msc > 0:
@@ -308,6 +315,61 @@ def restart_reconciliation_report(
 
     deals = list(broker.history_deals(start, current, symbol=symbol, magic=magic))
     deals = sorted(deals, key=lambda item: (int(item.time_msc), int(item.ticket)))
+
+    pending_resolution = resolve_pending_order_intent(
+        state.get("pending_order_intent") if state else None,
+        deals,
+        positions,
+        volume_tolerance=cfg.volume_tolerance,
+    )
+    if state and state.get("pending_order_intent") is not None:
+        if pending_resolution.resolved:
+            if persist:
+                append_recovered_event(events_path, state["pending_order_intent"], pending_resolution)
+                state["pending_order_intent"] = None
+                current_cursor = (
+                    int(state.get("last_deal_time_msc", 0) or 0),
+                    int(state.get("last_deal_ticket", 0) or 0),
+                )
+                resolved_cursor = (pending_resolution.cursor_time_msc, pending_resolution.cursor_ticket)
+                if resolved_cursor > current_cursor:
+                    state["last_deal_time_msc"] = resolved_cursor[0]
+                    state["last_deal_ticket"] = resolved_cursor[1]
+                if bool(state.get("halted", False)) and execution_halt_reason_resolvable(state.get("halt_reason")):
+                    state["halted"] = False
+                    state["halt_reason"] = None
+                    state["last_incident_fingerprint"] = None
+                atomic_write_json(state_path, state)
+            else:
+                incidents.append(
+                    ReconcileIncident(
+                        "PENDING_INTENT_RESOLVABLE_READ_ONLY",
+                        "CRITICAL",
+                        "broker evidence proves the pending intent, but health mode is read-only; run verify mode to persist recovery",
+                        strategy=pending_resolution.strategy,
+                        position_id=pending_resolution.position_id,
+                    )
+                )
+        else:
+            incidents.append(
+                ReconcileIncident(
+                    pending_resolution.code,
+                    "CRITICAL",
+                    pending_resolution.detail,
+                    strategy=pending_resolution.strategy,
+                    position_id=pending_resolution.position_id,
+                )
+            )
+
+    if state and bool(state.get("halted", False)):
+        incidents.append(
+            ReconcileIncident(
+                "LOCAL_LIVE_STATE_HALTED",
+                "CRITICAL",
+                f"local live state is halted: {state.get('halt_reason') or 'unspecified'}",
+            )
+        )
+
     lifecycles = build_deal_lifecycles(deals)
     local_entries = read_local_entries(events_path, cfg.event_backups)
 
@@ -464,6 +526,7 @@ def restart_reconciliation_report(
         "state_present": state is not None,
         "events_entries": len(local_entries),
         "broker_deals": len(deals),
+        "pending_intent_resolution": pending_resolution.to_dict(),
         "deal_cursor": {"time_msc": latest_cursor[0], "ticket": latest_cursor[1]},
         "managed_positions": [_snapshot_position(position) for position in positions],
         "incidents": [asdict(item) for item in incidents],

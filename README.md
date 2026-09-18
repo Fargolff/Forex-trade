@@ -561,3 +561,8 @@ This project is a research and execution framework, not a guarantee of profit. L
 ## Phase 16 — Order Execution & Partial-Fill Reconciliation
 
 Live order submission now uses normalized execution receipts (`FILLED`, `PARTIAL`, `PLACED`) and explicit rejection vs ambiguous-submission exceptions. A persistent `pending_order_intent` is written to `live_state.json` before every entry/close/flatten submission and is cleared only after a fully confirmed fill and durable audit event. Partial fills, accepted-but-unconfirmed orders, missing submission results, fill-volume mismatches, and unexpected execution exceptions halt new trading without automatic resend or auto-repair. A leftover intent after restart is itself a CRITICAL fail-closed condition and requires broker-state reconciliation before manual clearance.
+
+## Phase 17 — Deterministic Pending-Intent Resolver
+
+<!-- PHASE17_DETERMINISTIC_PENDING_INTENT_RESOLVER -->
+Phase 17 turns the Phase 16 pending-order journal into a deterministic restart resolver. New intents persist a unique intent ID, submission timestamp, stable position identifier, and full `(time_msc, ticket)` pre-submit broker-deal cursor. Restart verification may reconstruct a missing local audit event and clear an execution-only halt only when MT5 deals plus current position state prove the exact full entry/exit. Legacy, partial, conflicting, or otherwise ambiguous evidence remains fail-closed with no automatic resend or repair. See `docs/phase17-pending-intent-resolver.md`.
