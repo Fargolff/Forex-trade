@@ -11,7 +11,7 @@ if (-not (Test-Path $Python)) {
 # Phase 11 signed-release gate is opt-in until the operator has generated an
 # offline signing key and deployed the matching public key. When enabled, every
 # supervisor start/restart verifies BOTH the Ed25519 signature and file hashes.
-$RequireSignedRelease = $env:FOREX_REQUIRE_SIGNED_RELEASE
+$RequireSignedRelease = [string]$env:FOREX_REQUIRE_SIGNED_RELEASE
 $SignedReleaseEnabled = @("1", "true", "yes", "on") -contains $RequireSignedRelease.ToLowerInvariant()
 
 function Test-SignedRelease {
