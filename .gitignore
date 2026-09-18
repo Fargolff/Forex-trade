@@ -17,6 +17,9 @@ data/
 # Secrets / local environment
 .env
 .env.*
+release/*private*.pem
+*.release-private.pem
+*.key
 
 # OS/editor
 .DS_Store
