@@ -76,6 +76,9 @@ def generate_keypair(private_key_path: str | Path, public_key_path: str | Path) 
             encryption_algorithm=serialization.NoEncryption(),
         )
     )
+    if os.name != "nt":
+        private_path.chmod(0o600)
+
     public_path.write_bytes(
         public_key.public_bytes(
             encoding=serialization.Encoding.PEM,
