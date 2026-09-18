@@ -1,0 +1,34 @@
+name: Phase 15 Apply
+
+on:
+  push:
+    paths:
+      - '.github/workflows/phase15-apply.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/phase11-signed-release-gate
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply Phase 15 patch
+        run: python tools/phase15_apply.py
+      - name: Commit Phase 15 implementation
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src config.example.yaml README.md
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m "feat: add broker-native sizing and margin safety"
+          git push origin HEAD:codex/phase11-signed-release-gate
