@@ -9,6 +9,7 @@ venv/
 config.yaml
 production.yaml
 watchdog.yaml
+backup.yaml
 runtime/
 backups/
 results/
