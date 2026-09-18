@@ -28,6 +28,20 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "pandas>=2.2" "numpy>=2.0" "PyYAML>=6.0" "cryptography>=43.0" "pytest>=8.0"
 
+      - name: Normalize Phase 20 anchor
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path("config.example.yaml")
+          text = path.read_text(encoding="utf-8")
+          text = text.replace(
+              '  max_future_bar_seconds: 300\n\n  deal_reconcile_lookback_hours: 72\n',
+              '  max_future_bar_seconds: 300\n  deal_reconcile_lookback_hours: 72\n',
+              1,
+          )
+          path.write_text(text, encoding="utf-8")
+          PY
+
       - name: Apply Phase 20
         run: python tools/phase20_apply.py
 
