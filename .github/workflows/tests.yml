@@ -1,0 +1,36 @@
+name: Forex Auto Trader Tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "pandas>=2.2" "numpy>=2.0" "PyYAML>=6.0" "pytest>=8.0"
+
+      - name: Run tests
+        env:
+          PYTHONPATH: .
+        run: python -m pytest -q
+
+      - name: Run operational soak
+        env:
+          PYTHONPATH: .
+        run: python -m src.soak --cycles 300
