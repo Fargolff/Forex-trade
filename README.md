@@ -1,6 +1,6 @@
 # Forex Auto Trader Research Framework
 
-Personal automated-Forex research and execution framework with reproducible research, cost-aware backtests, robust validation, portfolio controls, paper-forward testing, guarded MT5 live execution, production supervision, an independent watchdog and disaster-recovery tooling.
+Personal automated-Forex research and execution framework with reproducible research, cost-aware backtests, robust validation, portfolio controls, paper-forward testing, guarded MT5 live execution, production supervision, an independent watchdog, disaster-recovery tooling and cryptographically signed deployment releases.
 
 ## Safety defaults
 
@@ -15,7 +15,8 @@ Personal automated-Forex research and execution framework with reproducible rese
 - Stale market data, position-integrity incidents, broker disconnects, account-risk breaches and production anomalies fail closed.
 - Phase 9 adds a persistent production halt that survives process/Windows restarts.
 - Phase 10 watchdog/recovery tools have **no broker-order path**.
-- Research `PASS`, portfolio OOS, paper results or clean health checks do not guarantee profitability.
+- Phase 11 can require an Ed25519-signed release before the Windows live supervisor starts or restarts.
+- Research `PASS`, portfolio OOS, paper results, signed releases or clean health checks do not guarantee profitability.
 
 ## Architecture
 
@@ -34,6 +35,8 @@ Guarded Live Engine
       ↓
 Broker Reconciliation + Runtime Health
       ↓
+Signed Release Verification
+      ↓
 Production Supervisor
       ↓
 External Watchdog + Disaster Recovery
@@ -49,7 +52,8 @@ Forex-trade/
 ├─ requirements.txt
 ├─ docs/
 │  ├─ phase9-production.md
-│  └─ phase10-watchdog-recovery.md
+│  ├─ phase10-watchdog-recovery.md
+│  └─ phase11-signed-release.md
 ├─ deploy/windows/
 │  ├─ run-live-supervisor.ps1
 │  ├─ install-scheduled-task.ps1
@@ -67,6 +71,7 @@ Forex-trade/
 │  ├─ portfolio.py
 │  ├─ production.py
 │  ├─ recovery.py
+│  ├─ release.py
 │  ├─ research.py
 │  ├─ risk.py
 │  ├─ soak.py
@@ -206,6 +211,22 @@ take_profit_distance   price distance
 
 See `docs/phase10-watchdog-recovery.md` for the disaster-recovery procedure.
 
+### Phase 11 — Cryptographically Signed Release Gate ✅
+
+- Ed25519 release key generation/signing/verification tooling
+- Detached signed deployment manifest
+- Public-key SHA-256 fingerprint reporting
+- Signature verification before deployment hash verification
+- Detects manifest tampering, wrong public key and deployment code drift
+- Private signing key excluded from Git and intended to remain off the trading machine
+- Generated private keys use restrictive permissions on non-Windows platforms
+- Opt-in Windows supervisor gate via `FOREX_REQUIRE_SIGNED_RELEASE=1`
+- Verification repeats before every supervisor start/restart
+- Existing live arming and production-risk gates remain mandatory
+- Dedicated Phase 11 tamper/wrong-key tests
+
+See `docs/phase11-signed-release.md` for the signing and key-rotation runbook.
+
 ## Quick start
 
 ```bash
@@ -327,7 +348,17 @@ python -m src.recovery --mode make-manifest
 python -m src.recovery --mode verify-manifest
 ```
 
-SHA-256 detects drift/corruption but is not a substitute for cryptographically signed releases.
+## Signed release verification
+
+Create a deployment manifest, sign it on the trusted signing machine, then verify it on the trading machine:
+
+```bash
+python -m src.recovery --mode make-manifest --manifest release/release_manifest.json
+python -m src.release --mode sign --manifest release/release_manifest.json --signature release/release_signature.json --private-key <OFFLINE_PRIVATE_KEY_PATH>
+python -m src.release --mode verify --root . --manifest release/release_manifest.json --signature release/release_signature.json --public-key release/forex-release-public.pem
+```
+
+After key setup and a successful manual verification, enable the Windows supervisor gate with `FOREX_REQUIRE_SIGNED_RELEASE=1`. The private key should not be present on the trading machine.
 
 ## Operational soak
 
@@ -356,7 +387,11 @@ Independent watchdog running
       ↓
 Backup + restore-preview drill
       ↓
-Deployment manifest verification
+Create deployment manifest
+      ↓
+Sign manifest with protected/offline key
+      ↓
+Verify signature + deployment hashes on trading machine
       ↓
 One explicitly armed tiny live cycle
       ↓
@@ -369,7 +404,7 @@ Only then consider longer unattended operation
 
 ## Remaining maturity work
 
-- Cryptographic release signing with protected/offline signing keys
+- Hardware-backed/HSM release signing and protected key rotation workflow
 - Hosted heartbeat transport with authenticated publishing/acknowledgement
 - Broker-specific swap/financing forecasting and reconciliation policy
 - Broker holiday/weekend calendar semantics
