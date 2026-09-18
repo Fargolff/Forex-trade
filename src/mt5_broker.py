@@ -163,6 +163,22 @@ class BrokerDeal:
     comment: str
     entry: int
 
+@dataclass(frozen=True)
+class BrokerWorkingOrder:
+    ticket: int
+    time_setup_msc: int
+    time_done_msc: int
+    symbol: str
+    side: int
+    volume_initial: float
+    volume_current: float
+    price_open: float
+    stop_loss: float
+    take_profit: float
+    magic: int
+    comment: str
+    state: str
+
 
 class BrokerOrderRejected(RuntimeError):
     """Broker explicitly rejected an order before/at submission."""
@@ -361,6 +377,96 @@ class MT5Broker:
                 )
             )
         return sorted(out, key=lambda item: (item.time_msc, item.ticket))
+
+    def _order_state_name(self, state: int) -> str:
+        mapping = {
+            int(getattr(mt5, "ORDER_STATE_STARTED", -101)): "STARTED",
+            int(getattr(mt5, "ORDER_STATE_PLACED", -102)): "PLACED",
+            int(getattr(mt5, "ORDER_STATE_CANCELED", -103)): "CANCELED",
+            int(getattr(mt5, "ORDER_STATE_PARTIAL", -104)): "PARTIAL",
+            int(getattr(mt5, "ORDER_STATE_FILLED", -105)): "FILLED",
+            int(getattr(mt5, "ORDER_STATE_REJECTED", -106)): "REJECTED",
+            int(getattr(mt5, "ORDER_STATE_EXPIRED", -107)): "EXPIRED",
+            int(getattr(mt5, "ORDER_STATE_REQUEST_ADD", -108)): "REQUEST_ADD",
+            int(getattr(mt5, "ORDER_STATE_REQUEST_MODIFY", -109)): "REQUEST_MODIFY",
+            int(getattr(mt5, "ORDER_STATE_REQUEST_CANCEL", -110)): "REQUEST_CANCEL",
+        }
+        return mapping.get(int(state), f"UNKNOWN:{int(state)}")
+
+    def _broker_order_side(self, order_type: int) -> int:
+        buy_types = {
+            int(getattr(mt5, "ORDER_TYPE_BUY", -201)),
+            int(getattr(mt5, "ORDER_TYPE_BUY_LIMIT", -202)),
+            int(getattr(mt5, "ORDER_TYPE_BUY_STOP", -203)),
+            int(getattr(mt5, "ORDER_TYPE_BUY_STOP_LIMIT", -204)),
+        }
+        sell_types = {
+            int(getattr(mt5, "ORDER_TYPE_SELL", -211)),
+            int(getattr(mt5, "ORDER_TYPE_SELL_LIMIT", -212)),
+            int(getattr(mt5, "ORDER_TYPE_SELL_STOP", -213)),
+            int(getattr(mt5, "ORDER_TYPE_SELL_STOP_LIMIT", -214)),
+        }
+        if int(order_type) in buy_types:
+            return 1
+        if int(order_type) in sell_types:
+            return -1
+        return 0
+
+    def _map_broker_order(self, order: Any) -> BrokerWorkingOrder:
+        setup_msc = int(getattr(order, "time_setup_msc", 0) or 0)
+        if setup_msc <= 0:
+            setup_msc = int(getattr(order, "time_setup", 0) or 0) * 1000
+        done_msc = int(getattr(order, "time_done_msc", 0) or 0)
+        if done_msc <= 0:
+            done_msc = int(getattr(order, "time_done", 0) or 0) * 1000
+        return BrokerWorkingOrder(
+            ticket=int(getattr(order, "ticket", 0) or 0),
+            time_setup_msc=setup_msc,
+            time_done_msc=done_msc,
+            symbol=str(getattr(order, "symbol", "") or ""),
+            side=self._broker_order_side(int(getattr(order, "type", -1))),
+            volume_initial=float(getattr(order, "volume_initial", 0.0) or 0.0),
+            volume_current=float(getattr(order, "volume_current", 0.0) or 0.0),
+            price_open=float(getattr(order, "price_open", 0.0) or 0.0),
+            stop_loss=float(getattr(order, "sl", 0.0) or 0.0),
+            take_profit=float(getattr(order, "tp", 0.0) or 0.0),
+            magic=int(getattr(order, "magic", 0) or 0),
+            comment=str(getattr(order, "comment", "") or ""),
+            state=self._order_state_name(int(getattr(order, "state", -1))),
+        )
+
+    def open_orders(self, symbol: str | None = None, magic: int | None = None) -> list[BrokerWorkingOrder]:
+        raw = mt5.orders_get(symbol=symbol) if symbol else mt5.orders_get()
+        if raw is None:
+            raise RuntimeError(f"orders_get failed: {mt5.last_error()}")
+        out: list[BrokerWorkingOrder] = []
+        for order in raw:
+            item = self._map_broker_order(order)
+            if magic is not None and item.magic != magic:
+                continue
+            out.append(item)
+        return sorted(out, key=lambda item: (item.time_setup_msc, item.ticket))
+
+    def history_orders(
+        self,
+        start: datetime,
+        end: datetime | None = None,
+        symbol: str | None = None,
+        magic: int | None = None,
+    ) -> list[BrokerWorkingOrder]:
+        finish = end or datetime.now(timezone.utc)
+        raw = mt5.history_orders_get(start, finish)
+        if raw is None:
+            raise RuntimeError(f"history_orders_get failed: {mt5.last_error()}")
+        out: list[BrokerWorkingOrder] = []
+        for order in raw:
+            item = self._map_broker_order(order)
+            if symbol is not None and item.symbol != symbol:
+                continue
+            if magic is not None and item.magic != magic:
+                continue
+            out.append(item)
+        return sorted(out, key=lambda item: (item.time_done_msc or item.time_setup_msc, item.ticket))
 
     def _order_type(self, side: int) -> int:
         if side == 1:

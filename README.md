@@ -566,3 +566,9 @@ Live order submission now uses normalized execution receipts (`FILLED`, `PARTIAL
 
 <!-- PHASE17_DETERMINISTIC_PENDING_INTENT_RESOLVER -->
 Phase 17 turns the Phase 16 pending-order journal into a deterministic restart resolver. New intents persist a unique intent ID, submission timestamp, stable position identifier, and full `(time_msc, ticket)` pre-submit broker-deal cursor. Restart verification may reconstruct a missing local audit event and clear an execution-only halt only when MT5 deals plus current position state prove the exact full entry/exit. Legacy, partial, conflicting, or otherwise ambiguous evidence remains fail-closed with no automatic resend or repair. See `docs/phase17-pending-intent-resolver.md`.
+
+## Phase 18 — Working-Order & Recovery-State Reconciliation
+
+`PHASE18_WORKING_ORDER_RECOVERY`
+
+Phase 18 tracks MT5 active/history orders by exact broker order ticket, persists receipt evidence before interpreting `PLACED`, prevents resends while an order is still working, detects orphan managed orders, and can auto-clear only a broker-proven terminal **no-fill** outcome. Partial/mismatched/missing evidence remains fail-closed. See `docs/phase18-working-order-recovery.md`.

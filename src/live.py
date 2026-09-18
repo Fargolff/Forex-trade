@@ -328,7 +328,7 @@ class LiveTradingEngine:
         position_id: int = 0,
     ) -> dict[str, Any]:
         intent = {
-            "version": 2,
+            "version": 3,
             "intent_id": uuid.uuid4().hex,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "deal_cursor_before_submit": {
@@ -338,6 +338,7 @@ class LiveTradingEngine:
             "action": action,
             "strategy": strategy,
             "symbol": self.symbol,
+            "magic": int(self.config.magic),
             "side": int(side),
             "lots": float(lots),
             "stop_loss": float(stop_loss),
@@ -349,6 +350,23 @@ class LiveTradingEngine:
         self.state.pending_order_intent = intent
         self.store.save(self.state)
         return intent
+
+
+    def _persist_execution_receipt(self, receipt: ExecutionReceipt) -> None:
+        if self.state.pending_order_intent is None:
+            return
+        intent = dict(self.state.pending_order_intent)
+        intent["broker_receipt_status"] = str(receipt.status)
+        intent["broker_retcode"] = int(receipt.retcode)
+        intent["broker_order_ticket"] = int(receipt.order)
+        intent["broker_deal_ticket"] = int(receipt.deal)
+        intent["broker_requested_volume"] = float(receipt.requested_volume)
+        intent["broker_filled_volume"] = float(receipt.filled_volume)
+        intent["broker_receipt_price"] = float(receipt.price)
+        self.state.pending_order_intent = intent
+        # Persist broker acknowledgement before interpreting PLACED/PARTIAL.
+        # A crash after this save can be reconciled by exact broker order ticket.
+        self.store.save(self.state)
 
     def _clear_order_intent(self) -> None:
         self.state.pending_order_intent = None
@@ -512,6 +530,7 @@ class LiveTradingEngine:
                 )
                 raise
 
+            self._persist_execution_receipt(receipt)
             issue = execution_receipt_issue(
                 receipt, position.volume, max(self.broker.symbol_spec(position.symbol).volume_step / 2.0, 1e-12)
             )
@@ -734,6 +753,7 @@ class LiveTradingEngine:
                     self._write_heartbeat(report, status="HALTED")
                     return self.snapshot()
 
+                self._persist_execution_receipt(close_receipt)
                 close_issue = execution_receipt_issue(
                     close_receipt, existing.volume, max(spec.volume_step / 2.0, 1e-12)
                 )
@@ -943,6 +963,7 @@ class LiveTradingEngine:
                 self._write_heartbeat(report, status="HALTED")
                 return self.snapshot()
 
+            self._persist_execution_receipt(receipt)
             issue = execution_receipt_issue(receipt, lots, max(spec.volume_step / 2.0, 1e-12))
             if issue:
                 self._execution_fail_closed(

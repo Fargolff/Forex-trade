@@ -18,6 +18,7 @@ from .pending_intent import (
     execution_halt_reason_resolvable,
     resolve_pending_order_intent,
 )
+from .order_recovery import assess_pending_order_recovery, append_no_fill_recovered_event
 from .production import atomic_write_json
 
 
@@ -220,6 +221,24 @@ def _checkpoint_cursor(checkpoint: dict[str, Any] | None) -> tuple[int, int]:
         return (0, 0)
 
 
+def _snapshot_order(order: Any) -> dict[str, Any]:
+    return {
+        "ticket": int(order.ticket),
+        "time_setup_msc": int(order.time_setup_msc),
+        "time_done_msc": int(order.time_done_msc),
+        "symbol": str(order.symbol),
+        "side": int(order.side),
+        "volume_initial": float(order.volume_initial),
+        "volume_current": float(order.volume_current),
+        "price_open": float(order.price_open),
+        "stop_loss": float(order.stop_loss),
+        "take_profit": float(order.take_profit),
+        "magic": int(order.magic),
+        "comment": str(order.comment),
+        "state": str(order.state),
+    }
+
+
 def _snapshot_position(position: BrokerPosition) -> dict[str, Any]:
     return {
         "ticket": int(position.ticket),
@@ -307,22 +326,69 @@ def restart_reconciliation_report(
     deals = list(broker.history_deals(start, current, symbol=symbol, magic=magic))
     deals = sorted(deals, key=lambda item: (int(item.time_msc), int(item.ticket)))
 
-    pending_resolution = resolve_pending_order_intent(
-        state.get("pending_order_intent") if state else None,
+    open_orders_fn = getattr(broker, "open_orders", None)
+    history_orders_fn = getattr(broker, "history_orders", None)
+    working_orders = list(open_orders_fn(symbol=symbol, magic=magic)) if callable(open_orders_fn) else []
+    history_orders = (
+        list(history_orders_fn(start, current, symbol=symbol, magic=magic))
+        if callable(history_orders_fn)
+        else []
+    )
+
+    pending_intent = state.get("pending_order_intent") if state else None
+    pending_recovery = assess_pending_order_recovery(
+        pending_intent,
         deals,
         positions,
+        working_orders,
+        history_orders,
         volume_tolerance=cfg.volume_tolerance,
     )
+
+    pending_ticket = 0
+    if isinstance(pending_intent, dict):
+        try:
+            pending_ticket = int(pending_intent.get("broker_order_ticket", 0) or 0)
+        except (TypeError, ValueError):
+            pending_ticket = 0
+    if state is None and working_orders:
+        incidents.append(
+            ReconcileIncident(
+                "LOCAL_STATE_MISSING_WITH_WORKING_ORDERS",
+                "CRITICAL",
+                f"{len(working_orders)} managed working order(s) exist but local live state is missing",
+            )
+        )
+    for order in working_orders:
+        if int(order.ticket) != pending_ticket:
+            incidents.append(
+                ReconcileIncident(
+                    "UNTRACKED_WORKING_ORDER",
+                    "CRITICAL",
+                    f"managed broker order {int(order.ticket)} state={order.state} is not the exact pending intent order",
+                )
+            )
     if state and state.get("pending_order_intent") is not None:
-        if pending_resolution.resolved:
+        if pending_recovery.resolved:
             if persist:
-                append_recovered_event(events_path, state["pending_order_intent"], pending_resolution)
+                if pending_recovery.effect == "FILLED":
+                    append_recovered_event(
+                        events_path,
+                        state["pending_order_intent"],
+                        pending_recovery.as_phase17_resolution(),
+                    )
+                elif pending_recovery.effect == "NO_FILL":
+                    append_no_fill_recovered_event(
+                        events_path,
+                        state["pending_order_intent"],
+                        pending_recovery,
+                    )
                 state["pending_order_intent"] = None
                 current_cursor = (
                     int(state.get("last_deal_time_msc", 0) or 0),
                     int(state.get("last_deal_ticket", 0) or 0),
                 )
-                resolved_cursor = (pending_resolution.cursor_time_msc, pending_resolution.cursor_ticket)
+                resolved_cursor = (pending_recovery.cursor_time_msc, pending_recovery.cursor_ticket)
                 if resolved_cursor > current_cursor:
                     state["last_deal_time_msc"] = resolved_cursor[0]
                     state["last_deal_ticket"] = resolved_cursor[1]
@@ -337,18 +403,18 @@ def restart_reconciliation_report(
                         "PENDING_INTENT_RESOLVABLE_READ_ONLY",
                         "CRITICAL",
                         "broker evidence proves the pending intent, but health mode is read-only; run verify mode to persist recovery",
-                        strategy=pending_resolution.strategy,
-                        position_id=pending_resolution.position_id,
+                        strategy=pending_recovery.strategy,
+                        position_id=pending_recovery.position_id,
                     )
                 )
         else:
             incidents.append(
                 ReconcileIncident(
-                    pending_resolution.code,
+                    pending_recovery.code,
                     "CRITICAL",
-                    pending_resolution.detail,
-                    strategy=pending_resolution.strategy,
-                    position_id=pending_resolution.position_id,
+                    pending_recovery.detail,
+                    strategy=pending_recovery.strategy,
+                    position_id=pending_recovery.position_id,
                 )
             )
 
@@ -506,7 +572,7 @@ def restart_reconciliation_report(
     latest_cursor = _cursor(deals)
     status = "CRITICAL" if incidents else "OK"
     report = {
-        "version": 1,
+        "version": 2,
         "generated_at": current.isoformat(),
         "status": status,
         "ok": status == "OK",
@@ -517,7 +583,10 @@ def restart_reconciliation_report(
         "state_present": state is not None,
         "events_entries": len(local_entries),
         "broker_deals": len(deals),
-        "pending_intent_resolution": pending_resolution.to_dict(),
+        "broker_working_orders": len(working_orders),
+        "broker_history_orders": len(history_orders),
+        "working_orders": [_snapshot_order(order) for order in working_orders],
+        "pending_intent_resolution": pending_recovery.to_dict(),
         "deal_cursor": {"time_msc": latest_cursor[0], "ticket": latest_cursor[1]},
         "managed_positions": [_snapshot_position(position) for position in positions],
         "incidents": [asdict(item) for item in incidents],
