@@ -21,6 +21,10 @@ release/*private*.pem
 *.release-private.pem
 *.key
 
+# Generated release artifacts
+release/*.zip
+release/*bundle*.signature.json
+
 # OS/editor
 .DS_Store
 Thumbs.db
