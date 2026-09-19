@@ -258,6 +258,8 @@ def _print_operational_report(report: dict) -> None:
 def _run_paper_mt5_once(cfg, args, engine: PaperTradingEngine) -> dict:
     history_bars = args.paper_history_bars or cfg.paper.history_bars
     completed = _mt5_completed_data(cfg, history_bars)
+    if engine.state.last_bar_time is None:
+        return engine.warm_start(completed)
     return engine.process(completed)
 
 

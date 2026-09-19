@@ -368,6 +368,50 @@ class PaperTradingEngine:
             reason=reason,
         )
 
+    def warm_start(self, bars: pd.DataFrame) -> dict[str, Any]:
+        """Seed a fresh forward-paper cursor without replaying historical bars.
+
+        MT5 history is indicator context only on the first paper poll. No historical
+        SIGNAL, ENTRY or EXIT event is created. Existing initialized state is left
+        untouched so restarts preserve the normal idempotent cursor semantics.
+        """
+        required = {"open", "high", "low", "close"}
+        missing = required.difference(bars.columns)
+        if missing:
+            raise ValueError(f"missing OHLC columns: {sorted(missing)}")
+        if bars.empty:
+            return self.snapshot()
+        if not isinstance(bars.index, pd.DatetimeIndex):
+            raise ValueError("paper bars require a DatetimeIndex")
+        if self.state.last_bar_time is not None:
+            return self.snapshot()
+        if self.state.positions or self.state.pending_signals:
+            raise RuntimeError("cannot warm-start an uninitialized paper state with execution state")
+
+        ordered = bars.sort_index()
+        latest_ts = pd.Timestamp(ordered.index[-1])
+        latest_close = float(ordered.iloc[-1]["close"])
+        self.state.current_day = latest_ts.date().isoformat()
+        self.state.start_of_day_equity = self.state.equity
+        self.state.last_bar_time = latest_ts.isoformat()
+        self._mark_to_market(latest_close)
+        self.store.save(self.state)
+        self.events.append(
+            time=datetime.now(timezone.utc).isoformat(),
+            event="WARM_START",
+            strategy="PORTFOLIO",
+            side="",
+            lots="",
+            expected_price=latest_close,
+            fill_price="",
+            slippage_pips="",
+            pnl="",
+            balance=self.state.balance,
+            equity=self.state.equity,
+            reason=f"forward_only_seed;latest_completed_bar={latest_ts.isoformat()};history_bars={len(ordered)}",
+        )
+        return self.snapshot()
+
     def process(self, bars: pd.DataFrame) -> dict[str, Any]:
         required = {"open", "high", "low", "close"}
         missing = required.difference(bars.columns)

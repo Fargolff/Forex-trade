@@ -338,7 +338,7 @@ python -m src.main --mode paper-mt5-once
 python -m src.main --mode paper-mt5-daemon
 ```
 
-Paper mode uses MT5 market data only and does not expose order execution.
+Paper mode uses MT5 market data only and does not expose order execution. On a fresh MT5 paper state, the first poll is a forward-only warm start: historical completed bars seed the cursor/indicator context but cannot create historical paper trades. `paper-demo` retains historical-simulation behavior. See `docs/phase22-forward-only-paper.md`.
 
 ## Guarded live and operations
 
