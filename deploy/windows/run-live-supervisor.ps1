@@ -70,6 +70,20 @@ if (-not [string]::IsNullOrWhiteSpace($CalendarCoverageRaw)) {
     $CalendarMinCoverageDays = $ParsedCoverageDays
 }
 
+# Phase 26 binds runtime risk/config and portfolio artifacts to the signed
+# release manifest. Like Phase 25, it defaults on whenever Phase 11 signed
+# release verification is enabled. Set the variable to 0 only for a deliberate
+# migration bypass.
+$RequireRuntimeProvenanceRaw = [string]$env:FOREX_REQUIRE_RUNTIME_PROVENANCE
+if ([string]::IsNullOrWhiteSpace($RequireRuntimeProvenanceRaw)) {
+    $RuntimeProvenanceEnabled = $SignedReleaseEnabled
+} else {
+    $RuntimeProvenanceEnabled = @("1", "true", "yes", "on") -contains $RequireRuntimeProvenanceRaw.ToLowerInvariant()
+}
+if ($RuntimeProvenanceEnabled -and -not $SignedReleaseEnabled) {
+    throw "FOREX_REQUIRE_RUNTIME_PROVENANCE requires FOREX_REQUIRE_SIGNED_RELEASE=1."
+}
+
 # Phase 14 broker/local restart reconciliation is fail-closed by default. A
 # temporary migration bypass requires the operator to explicitly set this to 0.
 $RestartReconcileRaw = [string]$env:FOREX_REQUIRE_RESTART_RECONCILE
@@ -159,6 +173,24 @@ function Test-MarketCalendarProvenance {
     }
 }
 
+function Test-RuntimeProvenance {
+    if (-not $RuntimeProvenanceEnabled) {
+        return
+    }
+
+    & $Python -m src.runtime_provenance `
+        --mode verify `
+        --root $ProjectRoot `
+        --manifest $Manifest `
+        --config config.yaml `
+        --reconcile-config $ReconcileConfig `
+        --required
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Runtime config/portfolio provenance verification failed. Supervised live will not start."
+    }
+}
+
 function Test-RestartReconciliation {
     if (-not $RestartReconcileEnabled) {
         Write-Warning "Phase 14 restart reconciliation is explicitly disabled by FOREX_REQUIRE_RESTART_RECONCILE."
@@ -191,6 +223,7 @@ while ($Restarts -le $MaxRestarts) {
     Test-SignedBundle
     Test-SignedRelease
     Test-MarketCalendarProvenance
+    Test-RuntimeProvenance
     Test-RestartReconciliation
 
     & $Python -m src.production --mode supervised-live --arm-live $ArmPhrase
