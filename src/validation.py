@@ -21,6 +21,12 @@ class ValidationConfig:
     parameter_perturbation: float = 0.20
     monte_carlo_runs: int = 1000
     monte_carlo_ruin_drawdown: float = 0.30
+    # Phase 21 pre-OOS qualification thresholds. These are evaluated only
+    # on Train/Validation and therefore cannot leak final OOS information.
+    min_validation_trades: int = 20
+    min_validation_profit_factor: float = 1.0
+    min_validation_sharpe: float = 0.0
+    max_validation_drawdown: float = 0.20
     min_oos_trades: int = 20
     min_oos_profit_factor: float = 1.0
     min_oos_sharpe: float = 0.0
@@ -360,6 +366,121 @@ def monte_carlo_trade_paths(
     }
 
 
+def _checks_verdict(checks: dict[str, bool]) -> tuple[str, int]:
+    passed = sum(bool(value) for value in checks.values())
+    if passed == len(checks):
+        return "PASS", passed
+    if passed >= len(checks) - 2:
+        return "WATCH", passed
+    return "REJECT", passed
+
+
+def qualify_strategy_pre_oos(
+    train: pd.DataFrame,
+    validation: pd.DataFrame,
+    backtest_cfg: BacktestConfig,
+    strategy_name: str,
+    base_params: dict[str, Any] | None = None,
+    cfg: ValidationConfig | None = None,
+) -> dict[str, Any]:
+    """Freeze a strategy decision using Train/Validation only.
+
+    Final OOS data is intentionally not accepted by this API. Candidate selection,
+    robustness checks and the qualification verdict are therefore structurally
+    unable to depend on OOS values.
+    """
+    cfg = cfg or ValidationConfig()
+    if train.empty or validation.empty:
+        raise ValueError("pre-OOS qualification requires non-empty train and validation slices")
+
+    selected_params, selection_table = select_parameters(
+        train,
+        validation,
+        backtest_cfg,
+        strategy_name,
+        base_params,
+        cfg.parameter_perturbation,
+    )
+    train_result = _run(train, backtest_cfg, strategy_name, selected_params)
+    validation_result = _run(validation, backtest_cfg, strategy_name, selected_params)
+    pre_oos = pd.concat([train, validation]).sort_index()
+
+    stability = parameter_stability(
+        pre_oos,
+        backtest_cfg,
+        strategy_name,
+        selected_params,
+        cfg.parameter_perturbation,
+    )
+    wf = walk_forward_evaluation(pre_oos, backtest_cfg, strategy_name, selected_params, cfg)
+    wf_valid = wf[wf["error"] == ""] if not wf.empty else wf
+    wf_positive_fraction = float(wf_valid["positive"].mean()) if not wf_valid.empty else 0.0
+
+    pre_oos_result = _run(pre_oos, backtest_cfg, strategy_name, selected_params)
+    pre_oos_trade_pnls = [float(trade.pnl) for trade in pre_oos_result["trade_log"]]
+    mc = monte_carlo_trade_paths(
+        pre_oos_trade_pnls,
+        backtest_cfg.initial_equity,
+        cfg.monte_carlo_runs,
+        cfg.monte_carlo_ruin_drawdown,
+        cfg.seed,
+    )
+
+    checks = {
+        "validation_min_trades": validation_result["trades"] >= cfg.min_validation_trades,
+        "validation_profit_factor": validation_result["profit_factor"] >= cfg.min_validation_profit_factor,
+        "validation_sharpe": validation_result["sharpe_approx"] >= cfg.min_validation_sharpe,
+        "validation_drawdown": validation_result["max_drawdown_pct"] <= cfg.max_validation_drawdown,
+        "walk_forward_consistency": wf_positive_fraction >= cfg.min_walk_forward_positive_fraction,
+        "parameter_stability": stability["positive_fraction"] >= cfg.min_parameter_stability_fraction,
+        "pre_oos_monte_carlo_ruin": mc["ruin_probability"] <= cfg.max_monte_carlo_ruin_probability,
+    }
+    verdict, passed = _checks_verdict(checks)
+
+    return {
+        "strategy": strategy_name,
+        "family": strategy_spec(strategy_name).family,
+        "verdict": verdict,
+        "checks_passed": passed,
+        "checks_total": len(checks),
+        "checks": checks,
+        "selected_params": selected_params,
+        "train": train_result,
+        "validation": validation_result,
+        "pre_oos": pre_oos_result,
+        "walk_forward_positive_fraction": wf_positive_fraction,
+        "parameter_stability_fraction": stability["positive_fraction"],
+        "parameter_stability_median_sharpe": stability["median_sharpe"],
+        "monte_carlo": mc,
+        "selection_table": selection_table,
+        "walk_forward": wf,
+        "stability_table": stability["table"],
+    }
+
+
+def pre_oos_validation_summary(report: dict[str, Any]) -> dict[str, Any]:
+    validation = report["validation"]
+    mc = report["monte_carlo"]
+    return {
+        "strategy": report["strategy"],
+        "family": report["family"],
+        "verdict": report["verdict"],
+        "pre_oos_verdict": report["verdict"],
+        "checks_passed": report["checks_passed"],
+        "checks_total": report["checks_total"],
+        "validation_return_pct": validation["return_pct"],
+        "validation_sharpe": validation["sharpe_approx"],
+        "validation_max_drawdown_pct": validation["max_drawdown_pct"],
+        "validation_profit_factor": validation["profit_factor"],
+        "validation_trades": validation["trades"],
+        "walk_forward_positive_fraction": report["walk_forward_positive_fraction"],
+        "parameter_stability_fraction": report["parameter_stability_fraction"],
+        "pre_oos_monte_carlo_ruin_probability": mc["ruin_probability"],
+        "selected_params": json.dumps(report["selected_params"], sort_keys=True),
+        "selection_stage": "PRE_OOS",
+    }
+
+
 def validate_strategy(
     df: pd.DataFrame,
     backtest_cfg: BacktestConfig,
@@ -369,32 +490,19 @@ def validate_strategy(
 ) -> dict[str, Any]:
     cfg = cfg or ValidationConfig()
     split = chronological_split(df, cfg.train_fraction, cfg.validation_fraction)
-
-    selected_params, selection_table = select_parameters(
+    qualification = qualify_strategy_pre_oos(
         split.train,
         split.validation,
         backtest_cfg,
         strategy_name,
         base_params,
-        cfg.parameter_perturbation,
+        cfg,
     )
 
-    train_result = _run(split.train, backtest_cfg, strategy_name, selected_params)
-    validation_result = _run(split.validation, backtest_cfg, strategy_name, selected_params)
+    selected_params = qualification["selected_params"]
+    train_result = qualification["train"]
+    validation_result = qualification["validation"]
     oos_result = _run(split.out_of_sample, backtest_cfg, strategy_name, selected_params)
-
-    pre_oos = pd.concat([split.train, split.validation])
-    stability = parameter_stability(
-        pre_oos,
-        backtest_cfg,
-        strategy_name,
-        selected_params,
-        cfg.parameter_perturbation,
-    )
-
-    wf = walk_forward_evaluation(pre_oos, backtest_cfg, strategy_name, selected_params, cfg)
-    wf_valid = wf[wf["error"] == ""] if not wf.empty else wf
-    wf_positive_fraction = float(wf_valid["positive"].mean()) if not wf_valid.empty else 0.0
 
     oos_trade_pnls = [float(t.pnl) for t in oos_result["trade_log"]]
     mc = monte_carlo_trade_paths(
@@ -410,17 +518,11 @@ def validate_strategy(
         "oos_profit_factor": oos_result["profit_factor"] >= cfg.min_oos_profit_factor,
         "oos_sharpe": oos_result["sharpe_approx"] >= cfg.min_oos_sharpe,
         "oos_drawdown": oos_result["max_drawdown_pct"] <= cfg.max_oos_drawdown,
-        "walk_forward_consistency": wf_positive_fraction >= cfg.min_walk_forward_positive_fraction,
-        "parameter_stability": stability["positive_fraction"] >= cfg.min_parameter_stability_fraction,
+        "walk_forward_consistency": qualification["walk_forward_positive_fraction"] >= cfg.min_walk_forward_positive_fraction,
+        "parameter_stability": qualification["parameter_stability_fraction"] >= cfg.min_parameter_stability_fraction,
         "monte_carlo_ruin": mc["ruin_probability"] <= cfg.max_monte_carlo_ruin_probability,
     }
-    passed = sum(bool(x) for x in checks.values())
-    if passed == len(checks):
-        verdict = "PASS"
-    elif passed >= len(checks) - 2:
-        verdict = "WATCH"
-    else:
-        verdict = "REJECT"
+    verdict, passed = _checks_verdict(checks)
 
     train_sharpe = float(train_result["sharpe_approx"])
     oos_sharpe = float(oos_result["sharpe_approx"])
@@ -433,18 +535,21 @@ def validate_strategy(
         "checks_passed": passed,
         "checks_total": len(checks),
         "checks": checks,
+        "pre_oos_verdict": qualification["verdict"],
+        "pre_oos_checks": qualification["checks"],
         "selected_params": selected_params,
         "train": train_result,
         "validation": validation_result,
         "out_of_sample": oos_result,
         "sharpe_decay": sharpe_decay,
-        "walk_forward_positive_fraction": wf_positive_fraction,
-        "parameter_stability_fraction": stability["positive_fraction"],
-        "parameter_stability_median_sharpe": stability["median_sharpe"],
+        "walk_forward_positive_fraction": qualification["walk_forward_positive_fraction"],
+        "parameter_stability_fraction": qualification["parameter_stability_fraction"],
+        "parameter_stability_median_sharpe": qualification["parameter_stability_median_sharpe"],
+        "pre_oos_monte_carlo": qualification["monte_carlo"],
         "monte_carlo": mc,
-        "selection_table": selection_table,
-        "walk_forward": wf,
-        "stability_table": stability["table"],
+        "selection_table": qualification["selection_table"],
+        "walk_forward": qualification["walk_forward"],
+        "stability_table": qualification["stability_table"],
     }
 
 
@@ -455,6 +560,7 @@ def validation_summary(report: dict[str, Any]) -> dict[str, Any]:
         "strategy": report["strategy"],
         "family": report["family"],
         "verdict": report["verdict"],
+        "pre_oos_verdict": report.get("pre_oos_verdict"),
         "checks_passed": report["checks_passed"],
         "checks_total": report["checks_total"],
         "oos_return_pct": oos["return_pct"],

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Iterable
@@ -10,7 +11,12 @@ import pandas as pd
 
 from .backtest import BacktestConfig, run_backtest
 from .strategy import build_signals
-from .validation import ValidationConfig, chronological_split, validate_strategy, validation_summary
+from .validation import (
+    ValidationConfig,
+    chronological_split,
+    pre_oos_validation_summary,
+    qualify_strategy_pre_oos,
+)
 
 
 @dataclass(frozen=True)
@@ -219,37 +225,48 @@ def research_portfolio(
     validation_cfg: ValidationConfig | None = None,
     portfolio_cfg: PortfolioConfig | None = None,
 ) -> dict[str, Any]:
+    """Build a portfolio with a structurally untouched final OOS slice.
+
+    Stage A sees only Train/Validation and freezes candidates, parameters and
+    portfolio weights. Stage B evaluates the frozen design on OOS exactly once.
+    """
     validation_cfg = validation_cfg or ValidationConfig()
     portfolio_cfg = portfolio_cfg or PortfolioConfig()
     split = chronological_split(df, validation_cfg.train_fraction, validation_cfg.validation_fraction)
-    pre_oos = pd.concat([split.train, split.validation])
+    pre_oos = pd.concat([split.train, split.validation]).sort_index()
 
     pre_curves: dict[str, pd.Series] = {}
-    oos_curves: dict[str, pd.Series] = {}
+    frozen_params: dict[str, dict[str, Any]] = {}
     candidate_rows: list[dict[str, Any]] = []
 
+    # Stage A: OOS is not passed to the qualification API at all.
     for name in strategy_names:
         try:
-            report = validate_strategy(df, backtest_cfg, name, cfg=validation_cfg)
-            summary = validation_summary(report)
-            selected = report["selected_params"]
-            row = dict(summary)
-            row["included"] = report["verdict"] in portfolio_cfg.allowed_verdicts
+            qualification = qualify_strategy_pre_oos(
+                split.train,
+                split.validation,
+                backtest_cfg,
+                name,
+                cfg=validation_cfg,
+            )
+            selected = qualification["selected_params"]
+            row = dict(pre_oos_validation_summary(qualification))
+            row["included"] = qualification["verdict"] in portfolio_cfg.allowed_verdicts
             row["error"] = ""
             candidate_rows.append(row)
 
             if not row["included"]:
                 continue
-
             pre_result = run_backtest(build_signals(pre_oos, name, selected), backtest_cfg)
-            oos_result = run_backtest(build_signals(split.out_of_sample, name, selected), backtest_cfg)
             pre_curves[name] = pre_result["equity_curve"]
-            oos_curves[name] = oos_result["equity_curve"]
+            frozen_params[name] = dict(selected)
         except Exception as exc:
             candidate_rows.append(
                 {
                     "strategy": name,
                     "verdict": "ERROR",
+                    "pre_oos_verdict": "ERROR",
+                    "selection_stage": "PRE_OOS",
                     "included": False,
                     "error": str(exc),
                 }
@@ -258,17 +275,62 @@ def research_portfolio(
     candidate_table = pd.DataFrame(candidate_rows)
     if len(pre_curves) < portfolio_cfg.min_strategies:
         raise RuntimeError(
-            f"only {len(pre_curves)} strategies passed the portfolio gate; "
+            f"only {len(pre_curves)} strategies passed the pre-OOS portfolio gate; "
             f"at least {portfolio_cfg.min_strategies} are required"
         )
 
     pre_returns = _returns_from_curves(pre_curves)
-    oos_returns = _returns_from_curves(oos_curves)
     weights = diversification_weights(pre_returns, portfolio_cfg.max_strategy_weight)
-    oos_returns = oos_returns.reindex(columns=weights.index).fillna(0.0)
-
     corr = correlation_matrix(pre_returns.loc[:, weights.index])
     risk = risk_contributions(pre_returns, weights)
+
+    frozen_rows = [
+        {
+            "strategy": name,
+            "weight": float(weights.loc[name]),
+            "selected_params": json.dumps(frozen_params[name], sort_keys=True),
+        }
+        for name in sorted(weights.index)
+    ]
+    frozen_design = pd.DataFrame(frozen_rows)
+    fingerprint_payload = [
+        {
+            "strategy": row["strategy"],
+            "weight": row["weight"],
+            "selected_params": json.loads(row["selected_params"]),
+        }
+        for row in frozen_rows
+    ]
+    design_fingerprint = hashlib.sha256(
+        json.dumps(fingerprint_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+    if not candidate_table.empty and "strategy" in candidate_table.columns:
+        candidate_table["frozen_active"] = candidate_table["strategy"].isin(set(weights.index))
+        candidate_table["design_fingerprint"] = design_fingerprint
+
+    # Stage B: the design is now frozen. OOS results are descriptive/evaluative only.
+    oos_curves: dict[str, pd.Series] = {}
+    individual_oos: dict[str, dict[str, Any]] = {}
+    for name in weights.index:
+        selected = frozen_params[name]
+        result = run_backtest(build_signals(split.out_of_sample, name, selected), backtest_cfg)
+        oos_curves[name] = result["equity_curve"]
+        individual_oos[name] = {
+            "oos_return_pct": result["return_pct"],
+            "oos_sharpe": result["sharpe_approx"],
+            "oos_max_drawdown_pct": result["max_drawdown_pct"],
+            "oos_profit_factor": result["profit_factor"],
+            "oos_trades": result["trades"],
+        }
+
+    for metric in ("oos_return_pct", "oos_sharpe", "oos_max_drawdown_pct", "oos_profit_factor", "oos_trades"):
+        if not candidate_table.empty and "strategy" in candidate_table.columns:
+            candidate_table[metric] = candidate_table["strategy"].map(
+                {name: values[metric] for name, values in individual_oos.items()}
+            )
+
+    oos_returns = _returns_from_curves(oos_curves).reindex(columns=weights.index).fillna(0.0)
     metrics = portfolio_metrics(
         oos_returns,
         weights,
@@ -292,8 +354,24 @@ def research_portfolio(
         }
     )
     if not candidate_table.empty and "strategy" in candidate_table.columns:
-        cols = [c for c in ("strategy", "family", "verdict", "oos_return_pct", "oos_sharpe", "oos_max_drawdown_pct", "selected_params") if c in candidate_table.columns]
+        cols = [
+            column
+            for column in (
+                "strategy",
+                "family",
+                "pre_oos_verdict",
+                "validation_return_pct",
+                "validation_sharpe",
+                "validation_max_drawdown_pct",
+                "oos_return_pct",
+                "oos_sharpe",
+                "oos_max_drawdown_pct",
+                "selected_params",
+            )
+            if column in candidate_table.columns
+        ]
         weight_table = weight_table.merge(candidate_table[cols], on="strategy", how="left")
+    weight_table["design_fingerprint"] = design_fingerprint
 
     summary = {
         "strategies": int(len(weights)),
@@ -306,7 +384,12 @@ def research_portfolio(
         "monte_carlo_p95_drawdown": mc["p95_max_drawdown"],
         "monte_carlo_loss_probability": mc["loss_probability"],
         "monte_carlo_ruin_probability": mc["ruin_probability"],
-        "weights_json": json.dumps({k: float(v) for k, v in weights.items()}, sort_keys=True),
+        "weights_json": json.dumps({key: float(value) for key, value in weights.items()}, sort_keys=True),
+        "selection_stage": "PRE_OOS_FROZEN",
+        "selection_data_end": pre_oos.index[-1].isoformat() if hasattr(pre_oos.index[-1], "isoformat") else str(pre_oos.index[-1]),
+        "oos_data_start": split.out_of_sample.index[0].isoformat() if hasattr(split.out_of_sample.index[0], "isoformat") else str(split.out_of_sample.index[0]),
+        "oos_evaluated_after_freeze": True,
+        "design_fingerprint": design_fingerprint,
     }
 
     return {
@@ -314,6 +397,7 @@ def research_portfolio(
         "weights": weight_table,
         "correlation": corr,
         "candidate_table": candidate_table,
+        "frozen_design": frozen_design,
         "oos_equity_curve": metrics["equity_curve"],
         "oos_returns": metrics["returns"],
         "monte_carlo": mc,
@@ -328,11 +412,13 @@ def save_portfolio_report(report: dict[str, Any], output_dir: str | Path) -> dic
         "weights": root / "portfolio_weights.csv",
         "correlation": root / "strategy_correlation.csv",
         "candidates": root / "portfolio_candidates.csv",
+        "frozen_design": root / "portfolio_frozen_design.csv",
         "equity": root / "portfolio_oos_equity.csv",
     }
     pd.DataFrame([report["summary"]]).to_csv(paths["summary"], index=False)
     report["weights"].to_csv(paths["weights"], index=False)
     report["correlation"].to_csv(paths["correlation"])
     report["candidate_table"].to_csv(paths["candidates"], index=False)
+    report["frozen_design"].to_csv(paths["frozen_design"], index=False)
     report["oos_equity_curve"].rename("equity").to_csv(paths["equity"], header=True)
     return paths

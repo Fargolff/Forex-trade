@@ -132,7 +132,8 @@ take_profit_distance   price distance
 
 ### Phase 4 — Robust Validation ✅
 
-- Chronological Train / Validation / untouched OOS split
+- Chronological Train / Validation / final OOS split
+- Phase 21 structurally prevents final OOS from entering portfolio candidate/parameter/weight selection
 - Bounded parameter-neighborhood selection
 - Rolling walk-forward evaluation
 - Parameter-stability checks
@@ -146,8 +147,10 @@ take_profit_distance   price distance
 - Correlation-penalized inverse-volatility allocation
 - Maximum strategy-weight cap
 - Risk contributions and diversification metrics
-- Portfolio OOS metrics and block-bootstrap Monte Carlo
-- CSV exports for weights, candidates, correlation and OOS equity
+- Portfolio candidates, selected parameters and weights are frozen from pre-OOS data before final OOS is evaluated
+- SHA-256 frozen-design fingerprint makes the pre-OOS decision auditable/reproducible
+- Portfolio OOS metrics and block-bootstrap Monte Carlo are evaluation-only and cannot change the frozen design
+- CSV exports for weights, candidates, frozen design, correlation and OOS equity
 
 ### Phase 6 — MT5 Paper Trading ✅
 
