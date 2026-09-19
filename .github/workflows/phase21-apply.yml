@@ -28,6 +28,17 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "pandas>=2.2" "numpy>=2.0" "PyYAML>=6.0" "cryptography>=43.0" "pytest>=8.0"
 
+      - name: Normalize Phase 21 patch markers
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path("tools/phase21_apply.py")
+          text = path.read_text(encoding="utf-8")
+          text = text.replace('"def validation_summary(\\n",', '"def validation_summary(",', 1)
+          text = text.replace('"def save_portfolio_report(\\n",', '"def save_portfolio_report(",', 1)
+          path.write_text(text, encoding="utf-8")
+          PY
+
       - name: Apply Phase 21
         run: python tools/phase21_apply.py
 
