@@ -2,12 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import os
 import re
 
 import pandas as pd
 
+from .market_calendar import evaluate_market_calendar, load_market_calendar
+
 
 _HHMM = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+_TRUTHY = {"1", "true", "yes", "on"}
 
 
 def parse_hhmm_utc(value: str) -> tuple[int, int]:
@@ -27,6 +31,19 @@ def _as_utc(value: pd.Timestamp | datetime) -> datetime:
     return ts.to_pydatetime()
 
 
+def _truthy(value: str | None) -> bool:
+    return str(value or "").strip().lower() in _TRUTHY
+
+
+def _min_transition(*values: str | None) -> str | None:
+    parsed: list[datetime] = []
+    for value in values:
+        if not value:
+            continue
+        parsed.append(datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc))
+    return min(parsed).isoformat() if parsed else None
+
+
 @dataclass(frozen=True)
 class WeeklyFxSessionPolicy:
     enabled: bool = True
@@ -35,6 +52,8 @@ class WeeklyFxSessionPolicy:
     transition_grace_seconds: float = 3600.0
     max_future_tick_seconds: float = 5.0
     max_future_bar_seconds: float = 300.0
+    market_calendar_path: str = "market_calendar.yaml"
+    market_calendar_required: bool = False
 
     def __post_init__(self) -> None:
         parse_hhmm_utc(self.sunday_open_utc)
@@ -45,6 +64,8 @@ class WeeklyFxSessionPolicy:
             raise ValueError("max_future_tick_seconds cannot be negative")
         if self.max_future_bar_seconds < 0:
             raise ValueError("max_future_bar_seconds cannot be negative")
+        if self.market_calendar_required and not str(self.market_calendar_path).strip():
+            raise ValueError("market_calendar_required needs a non-empty market_calendar_path")
 
 
 def _week_start(current: datetime) -> datetime:
@@ -75,17 +96,7 @@ def _nominal_market_open(current: datetime, policy: WeeklyFxSessionPolicy) -> bo
     return minute_of_day >= sunday_open
 
 
-def market_session_state(
-    now: datetime | None = None,
-    policy: WeeklyFxSessionPolicy | None = None,
-) -> dict[str, str | float | bool | None]:
-    current = now or datetime.now(timezone.utc)
-    if current.tzinfo is None:
-        current = current.replace(tzinfo=timezone.utc)
-    else:
-        current = current.astimezone(timezone.utc)
-    cfg = policy or WeeklyFxSessionPolicy()
-
+def _weekly_session_state(current: datetime, cfg: WeeklyFxSessionPolicy) -> dict[str, str | float | bool | None]:
     if not cfg.enabled:
         return {
             "state": "OPEN",
@@ -121,6 +132,100 @@ def market_session_state(
         "reason": "weekly_session_open" if opened else "weekly_session_closed",
         "next_transition_utc": next_boundary.isoformat() if next_boundary else None,
         "staleness_suppressed": not opened,
+    }
+
+
+def market_session_state(
+    now: datetime | None = None,
+    policy: WeeklyFxSessionPolicy | None = None,
+) -> dict[str, str | float | bool | None]:
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    else:
+        current = current.astimezone(timezone.utc)
+    cfg = policy or WeeklyFxSessionPolicy()
+    base = _weekly_session_state(current, cfg)
+
+    if not cfg.enabled:
+        return {
+            **base,
+            "calendar_loaded": False,
+            "calendar_applied": False,
+            "calendar_path": None,
+            "calendar_reason": "session_filter_disabled",
+            "next_calendar_transition_utc": None,
+        }
+
+    calendar_path = os.getenv("FOREX_MARKET_CALENDAR_PATH", cfg.market_calendar_path).strip()
+    calendar_required = bool(cfg.market_calendar_required or _truthy(os.getenv("FOREX_REQUIRE_MARKET_CALENDAR")))
+    if not calendar_path:
+        if calendar_required:
+            raise RuntimeError("market calendar is required but no path is configured")
+        return {
+            **base,
+            "calendar_loaded": False,
+            "calendar_applied": False,
+            "calendar_path": None,
+            "calendar_reason": "calendar_disabled",
+            "next_calendar_transition_utc": None,
+        }
+
+    calendar = load_market_calendar(calendar_path, required=calendar_required)
+    if calendar is None:
+        return {
+            **base,
+            "calendar_loaded": False,
+            "calendar_applied": False,
+            "calendar_path": calendar_path,
+            "calendar_reason": "calendar_file_absent",
+            "next_calendar_transition_utc": None,
+        }
+
+    cal = evaluate_market_calendar(
+        current,
+        calendar,
+        transition_grace_seconds=cfg.transition_grace_seconds,
+    )
+    base_state = str(base["state"])
+    calendar_state = str(cal["state"])
+
+    if base_state == "CLOSED":
+        final_state = "CLOSED"
+        reason = str(base["reason"])
+        if calendar_state == "CLOSED":
+            reason = f"{reason}|calendar:{cal['reason']}"
+    elif calendar_state == "CLOSED":
+        final_state = "CLOSED"
+        reason = f"calendar:{cal['reason']}"
+    elif base_state == "TRANSITION" or calendar_state == "TRANSITION":
+        final_state = "TRANSITION"
+        reasons = []
+        if base_state == "TRANSITION":
+            reasons.append(str(base["reason"]))
+        if calendar_state == "TRANSITION":
+            reasons.append(f"calendar:{cal['reason']}")
+        reason = "|".join(reasons)
+    else:
+        final_state = "OPEN"
+        reason = str(base["reason"])
+        if bool(cal.get("calendar_applied")):
+            reason = f"{reason}|calendar:{cal['reason']}"
+
+    next_transition = _min_transition(
+        str(base["next_transition_utc"]) if base["next_transition_utc"] else None,
+        str(cal["next_transition_utc"]) if cal["next_transition_utc"] else None,
+    )
+    return {
+        "state": final_state,
+        "reason": reason,
+        "next_transition_utc": next_transition,
+        "staleness_suppressed": final_state != "OPEN",
+        "calendar_loaded": True,
+        "calendar_applied": bool(cal.get("calendar_applied")),
+        "calendar_path": calendar.source_path,
+        "calendar_reason": str(cal["reason"]),
+        "next_calendar_transition_utc": cal["next_transition_utc"],
     }
 
 
