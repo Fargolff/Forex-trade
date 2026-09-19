@@ -1,5 +1,11 @@
 version: 1
 
+# Phase 25 provenance metadata. `valid_through` means the operator has reviewed
+# the broker's holiday/session schedule through this UTC date, including dates
+# with no override. It is NOT merely the date of the last holiday entry below.
+generated_at: "2026-09-20T00:00:00Z"
+valid_through: "2027-01-31"
+
 # Phase 24 broker-calendar restrictions are UTC and restriction-only.
 # They can close the market earlier or open it later than the normal weekly
 # session, but can never expand trading beyond the Phase 19/20 weekly envelope.

@@ -38,6 +38,38 @@ if ($SignedBundleEnabled -and -not $SignedReleaseEnabled) {
     throw "FOREX_REQUIRE_SIGNED_BUNDLE requires FOREX_REQUIRE_SIGNED_RELEASE=1."
 }
 
+# Phase 25 binds the external broker calendar to the signed release manifest.
+# When signed-release verification is enabled, provenance verification is enabled
+# by default as well. If no calendar exists and no binding is present, the gate
+# stays neutral unless Phase 24 explicitly requires a calendar.
+$CalendarPath = $env:FOREX_MARKET_CALENDAR_PATH
+if ([string]::IsNullOrWhiteSpace($CalendarPath)) {
+    $CalendarPath = "market_calendar.yaml"
+}
+
+$RequireMarketCalendarRaw = [string]$env:FOREX_REQUIRE_MARKET_CALENDAR
+$MarketCalendarRequired = @("1", "true", "yes", "on") -contains $RequireMarketCalendarRaw.ToLowerInvariant()
+
+$RequireCalendarProvenanceRaw = [string]$env:FOREX_REQUIRE_MARKET_CALENDAR_PROVENANCE
+if ([string]::IsNullOrWhiteSpace($RequireCalendarProvenanceRaw)) {
+    $CalendarProvenanceEnabled = $SignedReleaseEnabled
+} else {
+    $CalendarProvenanceEnabled = @("1", "true", "yes", "on") -contains $RequireCalendarProvenanceRaw.ToLowerInvariant()
+}
+if ($CalendarProvenanceEnabled -and -not $SignedReleaseEnabled) {
+    throw "FOREX_REQUIRE_MARKET_CALENDAR_PROVENANCE requires FOREX_REQUIRE_SIGNED_RELEASE=1."
+}
+
+$CalendarCoverageRaw = [string]$env:FOREX_MARKET_CALENDAR_MIN_COVERAGE_DAYS
+$CalendarMinCoverageDays = 30
+if (-not [string]::IsNullOrWhiteSpace($CalendarCoverageRaw)) {
+    $ParsedCoverageDays = 0
+    if (-not [int]::TryParse($CalendarCoverageRaw, [ref]$ParsedCoverageDays) -or $ParsedCoverageDays -lt 0) {
+        throw "FOREX_MARKET_CALENDAR_MIN_COVERAGE_DAYS must be a non-negative integer."
+    }
+    $CalendarMinCoverageDays = $ParsedCoverageDays
+}
+
 # Phase 14 broker/local restart reconciliation is fail-closed by default. A
 # temporary migration bypass requires the operator to explicitly set this to 0.
 $RestartReconcileRaw = [string]$env:FOREX_REQUIRE_RESTART_RECONCILE
@@ -105,6 +137,28 @@ function Test-SignedBundle {
     }
 }
 
+function Test-MarketCalendarProvenance {
+    if (-not $CalendarProvenanceEnabled) {
+        return
+    }
+
+    $CalendarArgs = @(
+        "-m", "src.calendar_provenance",
+        "--mode", "verify",
+        "--path", $CalendarPath,
+        "--manifest", $Manifest,
+        "--min-coverage-days", [string]$CalendarMinCoverageDays
+    )
+    if ($MarketCalendarRequired) {
+        $CalendarArgs += "--required"
+    }
+
+    & $Python @CalendarArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "Market calendar provenance/freshness verification failed. Supervised live will not start."
+    }
+}
+
 function Test-RestartReconciliation {
     if (-not $RestartReconcileEnabled) {
         Write-Warning "Phase 14 restart reconciliation is explicitly disabled by FOREX_REQUIRE_RESTART_RECONCILE."
@@ -136,6 +190,7 @@ $Restarts = 0
 while ($Restarts -le $MaxRestarts) {
     Test-SignedBundle
     Test-SignedRelease
+    Test-MarketCalendarProvenance
     Test-RestartReconciliation
 
     & $Python -m src.production --mode supervised-live --arm-live $ArmPhrase
