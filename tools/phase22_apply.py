@@ -1,0 +1,247 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+
+def replace_once(path: str, old: str, new: str) -> None:
+    p = Path(path)
+    text = p.read_text(encoding="utf-8")
+    if new in text:
+        return
+    if old not in text:
+        raise RuntimeError(f"Phase 22 marker missing in {path}: {old[:120]!r}")
+    p.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+
+def apply() -> None:
+    paper = Path("src/paper.py")
+    text = paper.read_text(encoding="utf-8")
+    if "    def warm_start(self, bars: pd.DataFrame) -> dict[str, Any]:\n" not in text:
+        marker = "    def process(self, bars: pd.DataFrame) -> dict[str, Any]:\n"
+        if marker not in text:
+            raise RuntimeError("PaperTradingEngine.process marker missing")
+        method = '''    def warm_start(self, bars: pd.DataFrame) -> dict[str, Any]:
+        """Seed a fresh forward-paper cursor without replaying historical bars.
+
+        MT5 history is indicator context only on the first paper poll. No historical
+        SIGNAL, ENTRY or EXIT event is created. Existing initialized state is left
+        untouched so restarts preserve the normal idempotent cursor semantics.
+        """
+        required = {"open", "high", "low", "close"}
+        missing = required.difference(bars.columns)
+        if missing:
+            raise ValueError(f"missing OHLC columns: {sorted(missing)}")
+        if bars.empty:
+            return self.snapshot()
+        if not isinstance(bars.index, pd.DatetimeIndex):
+            raise ValueError("paper bars require a DatetimeIndex")
+        if self.state.last_bar_time is not None:
+            return self.snapshot()
+        if self.state.positions or self.state.pending_signals:
+            raise RuntimeError("cannot warm-start an uninitialized paper state with execution state")
+
+        ordered = bars.sort_index()
+        latest_ts = pd.Timestamp(ordered.index[-1])
+        latest_close = float(ordered.iloc[-1]["close"])
+        self.state.current_day = latest_ts.date().isoformat()
+        self.state.start_of_day_equity = self.state.equity
+        self.state.last_bar_time = latest_ts.isoformat()
+        self._mark_to_market(latest_close)
+        self.store.save(self.state)
+        self.events.append(
+            time=datetime.now(timezone.utc).isoformat(),
+            event="WARM_START",
+            strategy="PORTFOLIO",
+            side="",
+            lots="",
+            expected_price=latest_close,
+            fill_price="",
+            slippage_pips="",
+            pnl="",
+            balance=self.state.balance,
+            equity=self.state.equity,
+            reason=f"forward_only_seed;latest_completed_bar={latest_ts.isoformat()};history_bars={len(ordered)}",
+        )
+        return self.snapshot()
+
+'''
+        paper.write_text(text.replace(marker, method + marker, 1), encoding="utf-8")
+
+    old_main = '''def _run_paper_mt5_once(cfg, args, engine: PaperTradingEngine) -> dict:
+    history_bars = args.paper_history_bars or cfg.paper.history_bars
+    completed = _mt5_completed_data(cfg, history_bars)
+    return engine.process(completed)
+'''
+    new_main = '''def _run_paper_mt5_once(cfg, args, engine: PaperTradingEngine) -> dict:
+    history_bars = args.paper_history_bars or cfg.paper.history_bars
+    completed = _mt5_completed_data(cfg, history_bars)
+    if engine.state.last_bar_time is None:
+        return engine.warm_start(completed)
+    return engine.process(completed)
+'''
+    replace_once("src/main.py", old_main, new_main)
+
+    Path("tests/test_phase22_paper_warm_start.py").write_text(
+        '''from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+from src.paper import PaperConfig, PaperTradingEngine
+
+
+def trending_bars(rows: int = 50) -> pd.DataFrame:
+    idx = pd.date_range("2026-06-01", periods=rows, freq="h", tz="UTC")
+    close = 1.10 + np.arange(rows) * 0.0004
+    open_ = np.r_[close[0], close[:-1]]
+    high = np.maximum(open_, close) + 0.0002
+    low = np.minimum(open_, close) - 0.0002
+    return pd.DataFrame({"open": open_, "high": high, "low": low, "close": close}, index=idx)
+
+
+def make_engine(tmp_path: Path) -> tuple[PaperTradingEngine, PaperConfig]:
+    cfg = PaperConfig(
+        initial_equity=10_000.0,
+        risk_per_trade=0.01,
+        max_daily_loss_pct=0.10,
+        max_drawdown_pct=0.20,
+        spread_pips=0.0,
+        slippage_pips=0.0,
+        commission_per_lot_round_turn=0.0,
+        state_path=str(tmp_path / "state.json"),
+        events_path=str(tmp_path / "events.csv"),
+    )
+    strategies = {
+        "momentum": {
+            "lookback": 2,
+            "threshold": 0.0,
+            "atr_period": 2,
+            "stop_atr": 10.0,
+            "take_profit_atr": 50.0,
+        }
+    }
+    return PaperTradingEngine("EURUSD", strategies, {"momentum": 1.0}, cfg), cfg
+
+
+def test_warm_start_seeds_latest_completed_bar_without_historical_trades(tmp_path):
+    bars = trending_bars(40)
+    engine, cfg = make_engine(tmp_path)
+    snapshot = engine.warm_start(bars)
+    assert pd.Timestamp(snapshot["last_bar_time"]) == bars.index[-1]
+    assert snapshot["open_positions"] == 0
+    assert snapshot["pending_signals"] == 0
+    assert snapshot["balance"] == 10_000.0
+    events = pd.read_csv(cfg.events_path)
+    assert events["event"].tolist() == ["WARM_START"]
+    assert not events["event"].isin(["SIGNAL", "ENTRY", "EXIT"]).any()
+
+
+def test_warm_start_is_idempotent_for_same_history(tmp_path):
+    bars = trending_bars(40)
+    engine, cfg = make_engine(tmp_path)
+    first = engine.warm_start(bars)
+    before = Path(cfg.events_path).read_text(encoding="utf-8")
+    restarted, _ = make_engine(tmp_path)
+    second = restarted.warm_start(bars)
+    assert second["last_bar_time"] == first["last_bar_time"]
+    assert Path(cfg.events_path).read_text(encoding="utf-8") == before
+
+
+def test_first_forward_bar_can_signal_but_cannot_execute_historical_signal(tmp_path):
+    bars = trending_bars(42)
+    engine, cfg = make_engine(tmp_path)
+    engine.warm_start(bars.iloc[:40])
+    first_forward = engine.process(bars.iloc[:41])
+    events = pd.read_csv(cfg.events_path)
+    assert pd.Timestamp(first_forward["last_bar_time"]) == bars.index[40]
+    assert (events["event"] == "ENTRY").sum() == 0
+    assert (events["event"] == "SIGNAL").sum() >= 1
+    second_forward = engine.process(bars.iloc[:42])
+    events = pd.read_csv(cfg.events_path)
+    entries = events[events["event"] == "ENTRY"]
+    assert pd.Timestamp(second_forward["last_bar_time"]) == bars.index[41]
+    assert not entries.empty
+    assert pd.Timestamp(entries.iloc[0]["time"]) == bars.index[41]
+
+
+def test_warm_start_refuses_uninitialized_execution_state(tmp_path):
+    bars = trending_bars(10)
+    engine, _ = make_engine(tmp_path)
+    engine.state.pending_signals["momentum"] = {
+        "side": 1,
+        "stop_distance": 0.001,
+        "take_profit_distance": 0.002,
+    }
+    try:
+        engine.warm_start(bars)
+    except RuntimeError as exc:
+        assert "execution state" in str(exc)
+    else:
+        raise AssertionError("warm_start should fail closed when execution state already exists")
+''',
+        encoding="utf-8",
+    )
+
+    Path("docs/phase22-forward-only-paper.md").write_text(
+        '''# Phase 22 — Forward-Only Paper Warm Start
+
+Phase 22 prevents a fresh MT5 paper-trading state from replaying the historical completed bars fetched for indicator context.
+
+## Problem fixed
+
+Before Phase 22, `paper-mt5-once` and `paper-mt5-daemon` passed the entire fetched history directly to `PaperTradingEngine.process()`. A fresh state has no `last_bar_time`, so every fetched historical bar was considered new and could create historical `SIGNAL`, `ENTRY` and `EXIT` events.
+
+## New first-run behavior
+
+For MT5 paper modes only:
+
+1. Fetch completed history as before.
+2. If the paper state has no cursor, call `warm_start()` instead of `process()`.
+3. Validate OHLC/index shape.
+4. Set `last_bar_time` to the newest completed bar.
+5. Persist the state atomically.
+6. Emit one audit-only `WARM_START` event.
+7. Do not calculate or queue historical paper execution events.
+
+On the next poll, the full history can still be used by the strategy indicators, but only bars strictly newer than the persisted cursor are processed by the execution engine.
+
+## Execution timing after warm start
+
+A signal produced by the first genuinely new completed bar is queued normally. It may execute no earlier than the following completed bar open. Historical signals that existed before the warm-start cursor are deliberately ignored because the forward-paper process was not running when they occurred.
+
+## Restart behavior
+
+Once `last_bar_time` exists, restart behavior is unchanged: already-seen bars are skipped and only bars newer than the persisted cursor are processed.
+
+## Existing pre-Phase-22 paper states
+
+Phase 22 does not rewrite or reset an existing paper state automatically. If an old state already contains historical replay trades, review/export it first and start a new paper state file if you want a clean forward-only experiment. Automatic balance/position-history repair would be unsafe and is intentionally not attempted.
+
+## Scope
+
+`paper-demo` remains a historical simulation tool and still processes supplied synthetic history from the beginning. The forward-only warm-start rule applies only to MT5 paper-forward modes. Paper mode still has no broker order path.
+
+## Regression coverage
+
+`tests/test_phase22_paper_warm_start.py` verifies history-only seeding, no historical execution events, idempotent restart, next-bar-open timing and fail-closed handling of unexpected execution state.
+''',
+        encoding="utf-8",
+    )
+
+    readme = Path("README.md")
+    r = readme.read_text(encoding="utf-8")
+    old = "Paper mode uses MT5 market data only and does not expose order execution.\n"
+    new = (
+        "Paper mode uses MT5 market data only and does not expose order execution. "
+        "On a fresh MT5 paper state, the first poll is a forward-only warm start: historical completed bars "
+        "seed the cursor/indicator context but cannot create historical paper trades. `paper-demo` retains "
+        "historical-simulation behavior. See `docs/phase22-forward-only-paper.md`.\n"
+    )
+    if new not in r:
+        if old not in r:
+            raise RuntimeError("README paper marker missing")
+        readme.write_text(r.replace(old, new, 1), encoding="utf-8")
+
+
+if __name__ == "__main__":
+    apply()
