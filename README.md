@@ -164,6 +164,20 @@ take_profit_distance   price distance
 - CSV audit trail
 - `paper-demo`, `paper-mt5-once`, `paper-mt5-daemon`
 
+### Phase 23 — Broker Swap / Financing Cost Realism ✅
+
+- Optional account-currency cash-per-lot rollover assumptions for backtest and paper
+- Separate long/short financing rates
+- UTC rollover hour plus configurable Monday-Sunday multipliers
+- Default Wednesday triple-swap schedule
+- Backtest `total_financing` and per-trade financing audit
+- Persistent/idempotent Paper `FINANCING` events and cumulative financing
+- Legacy paper states start financing forward from the last processed bar; no silent retro-charge
+- Live does not synthesize financing or double-charge broker-booked swap
+- Live health exposes raw MT5 swap terms (`swap_long`, `swap_short`, `swap_mode`, `swap_rollover3days`)
+
+See `docs/phase23-financing.md` before calibrating the assumptions to a broker.
+
 ### Phase 7 — Guarded Small Live Deployment ✅
 
 - Broker-native tick/value/volume sizing
@@ -552,7 +566,7 @@ Only then consider longer unattended operation
 
 - Hardware-backed/HSM release signing and protected key rotation workflow
 - Hosted heartbeat transport with authenticated publishing/acknowledgement
-- Broker-specific swap/financing forecasting and reconciliation policy
+- Historical broker swap-rate ingestion, holiday exceptions and broker-specific forecast calibration
 - Broker holiday/weekend calendar semantics
 - Restore-state reconciliation against every broker-side edge case
 - Multi-day broker-specific soak across reconnects, weekend closes and DST/time changes

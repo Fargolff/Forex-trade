@@ -82,6 +82,15 @@ def bar_age_seconds(bar_time: pd.Timestamp | datetime, now: datetime | None = No
     return max(0.0, (current - _as_utc(bar_time)).total_seconds())
 
 
+def broker_swap_terms(spec: Any) -> dict[str, float | int]:
+    return {
+        "long": float(getattr(spec, "swap_long", 0.0) or 0.0),
+        "short": float(getattr(spec, "swap_short", 0.0) or 0.0),
+        "mode": int(getattr(spec, "swap_mode", 0) or 0),
+        "rollover3days": int(getattr(spec, "swap_rollover3days", -1)),
+    }
+
+
 def market_freshness_incidents(
     bar_time: pd.Timestamp | datetime,
     tick: BrokerTick,
@@ -250,6 +259,7 @@ def operational_report(
         "account": account,
         "tick": tick,
         "symbol_spec": spec,
+        "broker_swap_terms": broker_swap_terms(spec),
         "positions": positions,
         "spread_pips": spread,
         "tick_age_seconds": tick_age_seconds(tick, current),

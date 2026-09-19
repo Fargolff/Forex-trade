@@ -6,6 +6,8 @@ from typing import Any
 
 import yaml
 
+from .financing import FinancingSchedule
+
 
 @dataclass(frozen=True)
 class StrategyConfig:
@@ -83,6 +85,7 @@ class AppConfig:
     spread_pips: float = 0.8
     slippage_pips: float = 0.2
     commission_per_lot_round_turn: float = 7.0
+    financing: FinancingSchedule = field(default_factory=FinancingSchedule)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     paper: PaperRuntimeConfig = field(default_factory=PaperRuntimeConfig)
     live: LiveConfig = field(default_factory=LiveConfig)
@@ -108,6 +111,16 @@ def _paper(data: dict[str, Any]) -> PaperRuntimeConfig:
     if cfg.history_bars < 100:
         raise ValueError("paper.history_bars must be >= 100")
     return cfg
+
+
+def _financing(data: dict[str, Any]) -> FinancingSchedule:
+    raw = dict(data or {})
+    if "weekday_multipliers" in raw:
+        values = raw.get("weekday_multipliers")
+        if not isinstance(values, (list, tuple)):
+            raise ValueError("financing.weekday_multipliers must be a list of 7 values")
+        raw["weekday_multipliers"] = tuple(float(value) for value in values)
+    return FinancingSchedule(**raw)
 
 
 def _valid_hhmm(value: str) -> bool:
@@ -193,6 +206,7 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
         raise ValueError("top-level YAML config must be a mapping")
     raw = dict(raw)
     strategy = _strategy(raw.pop("strategy", {}))
+    financing = _financing(raw.pop("financing", {}))
     paper = _paper(raw.pop("paper", {}))
     live = _live(raw.pop("live", {}))
-    return AppConfig(strategy=strategy, paper=paper, live=live, **raw)
+    return AppConfig(strategy=strategy, financing=financing, paper=paper, live=live, **raw)

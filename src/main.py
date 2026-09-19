@@ -75,6 +75,7 @@ def _backtest_config(cfg) -> BacktestConfig:
         spread_pips=cfg.spread_pips,
         slippage_pips=cfg.slippage_pips,
         commission_per_lot_round_turn=cfg.commission_per_lot_round_turn,
+        financing=cfg.financing,
         periods_per_year=_periods_per_year(cfg.timeframe),
     )
 
@@ -88,6 +89,7 @@ def _paper_config(cfg, args) -> PaperConfig:
         spread_pips=cfg.spread_pips,
         slippage_pips=cfg.slippage_pips,
         commission_per_lot_round_turn=cfg.commission_per_lot_round_turn,
+        financing=cfg.financing,
         state_path=args.paper_state or cfg.paper.state_path,
         events_path=args.paper_events or cfg.paper.events_path,
     )
@@ -247,6 +249,13 @@ def _print_operational_report(report: dict) -> None:
     print(f"Bar clock offset       : {report.get('bar_clock_offset_seconds')}s")
     print(f"Managed positions      : {len(report['positions'])}")
     print(f"Account equity         : {report['account'].equity:.2f} {report['account'].currency}")
+    swap = report.get("broker_swap_terms") or {}
+    if swap:
+        print(
+            "Broker swap raw        : "
+            f"long={swap.get('long')} short={swap.get('short')} "
+            f"mode={swap.get('mode')} rollover3days={swap.get('rollover3days')}"
+        )
     if report["incidents"]:
         print("Incidents:")
         for item in report["incidents"]:

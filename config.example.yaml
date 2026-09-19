@@ -13,6 +13,18 @@ spread_pips: 0.8
 slippage_pips: 0.2
 commission_per_lot_round_turn: 7.0
 
+# Phase 23 synthetic financing assumptions for backtest and paper only.
+# Values are account-currency cash per lot for a 1x rollover. Positive = credit,
+# negative = cost. Do not copy MT5 swap_long/swap_short blindly unless you have
+# confirmed the broker's swap_mode/unit conversion. Default remains disabled.
+financing:
+  enabled: false
+  long_cash_per_lot_rollover: 0.0
+  short_cash_per_lot_rollover: 0.0
+  rollover_hour_utc: 22
+  # Monday..Sunday. Default models Wednesday triple swap and no weekend event.
+  weekday_multipliers: [1, 1, 3, 1, 1, 0, 0]
+
 strategy:
   name: ema_trend
   params:

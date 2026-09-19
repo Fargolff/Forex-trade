@@ -50,6 +50,10 @@ class SymbolSpec:
     filling_mode: int
     trade_stops_level: int = 0
     trade_freeze_level: int = 0
+    swap_long: float = 0.0
+    swap_short: float = 0.0
+    swap_mode: int = 0
+    swap_rollover3days: int = -1
 
     @property
     def pip_size(self) -> float:
@@ -274,6 +278,10 @@ class MT5Broker:
             filling_mode=int(getattr(info, "filling_mode", 0)),
             trade_stops_level=int(getattr(info, "trade_stops_level", 0) or 0),
             trade_freeze_level=int(getattr(info, "trade_freeze_level", 0) or 0),
+            swap_long=float(getattr(info, "swap_long", 0.0) or 0.0),
+            swap_short=float(getattr(info, "swap_short", 0.0) or 0.0),
+            swap_mode=int(getattr(info, "swap_mode", 0) or 0),
+            swap_rollover3days=int(getattr(info, "swap_rollover3days", -1)),
         )
 
     def current_tick(self, symbol: str) -> BrokerTick:
