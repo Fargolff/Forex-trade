@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
 
+from .financing import FinancingSchedule, financing_between
 from .risk import RiskLimits, kill_switch_triggered, position_size_lots
 
 
@@ -19,6 +20,7 @@ class BacktestConfig:
     spread_pips: float = 0.8
     slippage_pips: float = 0.2
     commission_per_lot_round_turn: float = 7.0
+    financing: FinancingSchedule = field(default_factory=FinancingSchedule)
     periods_per_year: float = 252.0 * 24.0
 
 
@@ -32,6 +34,7 @@ class Trade:
     lots: float
     pnl: float
     reason: str
+    financing: float = 0.0
 
 
 def _entry_price(raw_price: float, side: int, cfg: BacktestConfig) -> float:
@@ -69,7 +72,22 @@ def _close_position(
         lots=float(position["lots"]),
         pnl=float(pnl),
         reason=reason,
+        financing=float(position.get("financing_accrued", 0.0)),
     )
+
+
+def _apply_position_financing(position: dict, ts: pd.Timestamp, cfg: BacktestConfig) -> float:
+    start = position.get("last_financing_time", position["entry_time"])
+    accrual = financing_between(
+        start,
+        ts,
+        side=int(position["side"]),
+        lots=float(position["lots"]),
+        schedule=cfg.financing,
+    )
+    position["last_financing_time"] = ts
+    position["financing_accrued"] = float(position.get("financing_accrued", 0.0)) + accrual.cash
+    return float(accrual.cash)
 
 
 def run_backtest(df: pd.DataFrame, cfg: BacktestConfig) -> dict:
@@ -90,6 +108,7 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig) -> dict:
     pending_signal: dict | None = None
     trades: list[Trade] = []
     equity_curve: list[tuple[pd.Timestamp, float]] = []
+    total_financing = 0.0
 
     limits = RiskLimits(
         risk_per_trade=cfg.risk_per_trade,
@@ -102,6 +121,11 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig) -> dict:
         if day != current_day:
             current_day = day
             start_of_day_equity = equity
+
+        if position is not None:
+            financing_cash = _apply_position_financing(position, ts, cfg)
+            equity += financing_cash
+            total_financing += financing_cash
 
         killed, kill_reason = kill_switch_triggered(start_of_day_equity, peak_equity, equity, limits)
         raw_open = float(row["open"])
@@ -148,6 +172,8 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig) -> dict:
                         "lots": lots,
                         "stop": entry - pending_side * stop_distance,
                         "tp": entry + pending_side * tp_distance,
+                        "last_financing_time": ts,
+                        "financing_accrued": 0.0,
                     }
             pending_signal = None
 
@@ -235,6 +261,8 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig) -> dict:
         "initial_equity": cfg.initial_equity,
         "final_equity": equity,
         "net_profit": equity - cfg.initial_equity,
+        "total_financing": float(total_financing),
+        "financing_enabled": bool(cfg.financing.enabled),
         "return_pct": (equity / cfg.initial_equity - 1) if cfg.initial_equity else 0.0,
         "max_drawdown_pct": float(max_dd),
         "sharpe_approx": float(annualized_sharpe),

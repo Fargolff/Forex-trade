@@ -9,6 +9,7 @@ from typing import Any, Iterable
 
 import pandas as pd
 
+from .market_clock import WeeklyFxSessionPolicy, evaluate_market_clock
 from .mt5_broker import BrokerDeal, BrokerPosition, BrokerTick
 
 
@@ -81,14 +82,26 @@ def bar_age_seconds(bar_time: pd.Timestamp | datetime, now: datetime | None = No
     return max(0.0, (current - _as_utc(bar_time)).total_seconds())
 
 
+def broker_swap_terms(spec: Any) -> dict[str, float | int]:
+    return {
+        "long": float(getattr(spec, "swap_long", 0.0) or 0.0),
+        "short": float(getattr(spec, "swap_short", 0.0) or 0.0),
+        "mode": int(getattr(spec, "swap_mode", 0) or 0),
+        "rollover3days": int(getattr(spec, "swap_rollover3days", -1)),
+    }
+
+
 def market_freshness_incidents(
     bar_time: pd.Timestamp | datetime,
     tick: BrokerTick,
     *,
     max_tick_age_seconds: float,
     max_bar_age_seconds: float,
+    suppress_staleness: bool = False,
     now: datetime | None = None,
 ) -> list[Incident]:
+    if suppress_staleness:
+        return []
     incidents: list[Incident] = []
     tick_age = tick_age_seconds(tick, now)
     bar_age = bar_age_seconds(bar_time, now)
@@ -174,6 +187,12 @@ def operational_report(
     *,
     max_tick_age_seconds: float,
     max_bar_age_seconds: float,
+    market_session_enabled: bool = True,
+    market_sunday_open_utc: str = "22:00",
+    market_friday_close_utc: str = "22:00",
+    market_transition_grace_seconds: float = 3600.0,
+    max_future_tick_seconds: float = 5.0,
+    max_future_bar_seconds: float = 300.0,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     terminal = broker.terminal_snapshot()
@@ -182,11 +201,42 @@ def operational_report(
     spec = broker.symbol_spec(symbol)
     positions = broker.open_positions(symbol=symbol, magic=magic)
     incidents: list[Incident] = []
+    current = now or datetime.now(timezone.utc)
+    policy = WeeklyFxSessionPolicy(
+        enabled=market_session_enabled,
+        sunday_open_utc=market_sunday_open_utc,
+        friday_close_utc=market_friday_close_utc,
+        transition_grace_seconds=market_transition_grace_seconds,
+        max_future_tick_seconds=max_future_tick_seconds,
+        max_future_bar_seconds=max_future_bar_seconds,
+    )
+    clock = evaluate_market_clock(
+        latest_completed_bar,
+        tick.time_msc,
+        now=current,
+        policy=policy,
+    )
 
     if not terminal.connected:
         incidents.append(Incident("MT5_DISCONNECTED", "CRITICAL", "MT5 terminal reports connected=false"))
     if not terminal.trade_allowed:
         incidents.append(Incident("TERMINAL_TRADING_DISABLED", "CRITICAL", "MT5 terminal reports trade_allowed=false"))
+    if clock["tick_future_violation"]:
+        incidents.append(
+            Incident(
+                "BROKER_TICK_IN_FUTURE",
+                "CRITICAL",
+                f"broker tick is {float(clock['tick_clock_offset_seconds']):.1f}s ahead of host UTC",
+            )
+        )
+    if clock["bar_future_violation"]:
+        incidents.append(
+            Incident(
+                "COMPLETED_BAR_IN_FUTURE",
+                "CRITICAL",
+                f"completed bar is {float(clock['bar_clock_offset_seconds']):.1f}s ahead of host UTC",
+            )
+        )
 
     incidents.extend(
         market_freshness_incidents(
@@ -194,7 +244,8 @@ def operational_report(
             tick,
             max_tick_age_seconds=max_tick_age_seconds,
             max_bar_age_seconds=max_bar_age_seconds,
-            now=now,
+            suppress_staleness=bool(clock["staleness_suppressed"]),
+            now=current,
         )
     )
     incidents.extend(position_integrity_incidents(positions, allowed_strategies))
@@ -208,10 +259,17 @@ def operational_report(
         "account": account,
         "tick": tick,
         "symbol_spec": spec,
+        "broker_swap_terms": broker_swap_terms(spec),
         "positions": positions,
         "spread_pips": spread,
-        "tick_age_seconds": tick_age_seconds(tick, now),
-        "bar_age_seconds": bar_age_seconds(latest_completed_bar, now),
+        "tick_age_seconds": tick_age_seconds(tick, current),
+        "bar_age_seconds": bar_age_seconds(latest_completed_bar, current),
+        "market_state": clock["state"],
+        "market_reason": clock["reason"],
+        "next_market_transition_utc": clock["next_transition_utc"],
+        "staleness_suppressed": bool(clock["staleness_suppressed"]),
+        "tick_clock_offset_seconds": clock["tick_clock_offset_seconds"],
+        "bar_clock_offset_seconds": clock["bar_clock_offset_seconds"],
         "incidents": incidents,
     }
 
@@ -222,6 +280,7 @@ def recent_managed_deals(
     magic: int,
     *,
     after_time_msc: int = 0,
+    after_ticket: int = 0,
     lookback_hours: float = 48.0,
     now: datetime | None = None,
 ) -> list[BrokerDeal]:
@@ -231,7 +290,16 @@ def recent_managed_deals(
     else:
         start = current - timedelta(hours=lookback_hours)
     deals = broker.history_deals(start, current, symbol=symbol, magic=magic)
-    return [deal for deal in deals if deal.time_msc > after_time_msc]
+    if int(after_ticket) > 0:
+        cursor = (int(after_time_msc), int(after_ticket))
+        selected = [deal for deal in deals if (int(deal.time_msc), int(deal.ticket)) > cursor]
+    else:
+        # Backward compatibility: callers that only provide the historical
+        # time_msc cursor expect all deals at that exact millisecond to be
+        # considered already consumed. Phase 17 uses the full tuple whenever
+        # last_deal_ticket is available.
+        selected = [deal for deal in deals if int(deal.time_msc) > int(after_time_msc)]
+    return sorted(selected, key=lambda item: (int(item.time_msc), int(item.ticket)))
 
 
 def deal_totals(deals: Iterable[BrokerDeal]) -> dict[str, float | int]:
@@ -256,6 +324,13 @@ def heartbeat_payload(
     tick_age_seconds_value: float | None = None,
     bar_age_seconds_value: float | None = None,
     last_deal_time_msc: int = 0,
+    last_deal_ticket: int = 0,
+    market_state: str | None = None,
+    market_reason: str | None = None,
+    next_market_transition_utc: str | None = None,
+    staleness_suppressed: bool = False,
+    tick_clock_offset_seconds_value: float | None = None,
+    bar_clock_offset_seconds_value: float | None = None,
 ) -> dict[str, Any]:
     pos = list(positions)
     return {
@@ -264,6 +339,7 @@ def heartbeat_payload(
         "symbol": symbol,
         "last_bar_time": last_bar_time,
         "last_deal_time_msc": int(last_deal_time_msc),
+        "last_deal_ticket": int(last_deal_ticket),
         "account": {
             "login": int(account.login),
             "currency": str(account.currency),
@@ -278,5 +354,11 @@ def heartbeat_payload(
         "spread_pips": spread_pips,
         "tick_age_seconds": tick_age_seconds_value,
         "bar_age_seconds": bar_age_seconds_value,
+        "market_state": market_state,
+        "market_reason": market_reason,
+        "next_market_transition_utc": next_market_transition_utc,
+        "staleness_suppressed": bool(staleness_suppressed),
+        "tick_clock_offset_seconds": tick_clock_offset_seconds_value,
+        "bar_clock_offset_seconds": bar_clock_offset_seconds_value,
         "incidents": [asdict(item) for item in incidents],
     }

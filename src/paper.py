@@ -9,6 +9,7 @@ from typing import Any
 
 import pandas as pd
 
+from .financing import FinancingSchedule, financing_between
 from .risk import RiskLimits, kill_switch_triggered, position_size_lots
 from .strategy import build_signals
 
@@ -24,6 +25,7 @@ class PaperConfig:
     spread_pips: float = 0.8
     slippage_pips: float = 0.2
     commission_per_lot_round_turn: float = 7.0
+    financing: FinancingSchedule = field(default_factory=FinancingSchedule)
     state_path: str = "runtime/paper_state.json"
     events_path: str = "runtime/paper_events.csv"
 
@@ -37,6 +39,8 @@ class PaperPosition:
     entry: float
     stop: float
     take_profit: float
+    last_financing_time: str | None = None
+    financing_accrued: float = 0.0
 
 
 @dataclass
@@ -50,6 +54,7 @@ class PaperState:
     last_bar_time: str | None = None
     halted: bool = False
     halt_reason: str | None = None
+    total_financing: float = 0.0
     positions: dict[str, PaperPosition] = field(default_factory=dict)
     pending_signals: dict[str, dict[str, float | int]] = field(default_factory=dict)
 
@@ -67,10 +72,15 @@ class PaperStateStore:
                 start_of_day_equity=initial_equity,
             )
         raw = json.loads(self.path.read_text(encoding="utf-8"))
-        positions = {
-            name: PaperPosition(**position)
-            for name, position in (raw.pop("positions", {}) or {}).items()
-        }
+        raw_positions = raw.pop("positions", {}) or {}
+        legacy_anchor = raw.get("last_bar_time")
+        positions: dict[str, PaperPosition] = {}
+        for name, position in raw_positions.items():
+            payload = dict(position)
+            payload.setdefault("last_financing_time", legacy_anchor or payload.get("entry_time"))
+            payload.setdefault("financing_accrued", 0.0)
+            positions[name] = PaperPosition(**payload)
+        raw.setdefault("total_financing", 0.0)
         return PaperState(positions=positions, **raw)
 
     def save(self, state: PaperState) -> None:
@@ -274,6 +284,8 @@ class PaperTradingEngine:
             entry=fill,
             stop=fill - side * stop_distance,
             take_profit=fill + side * take_profit_distance,
+            last_financing_time=ts.isoformat(),
+            financing_accrued=0.0,
         )
         self.events.append(
             time=ts.isoformat(),
@@ -337,8 +349,48 @@ class PaperTradingEngine:
             if reason is not None and raw_exit is not None:
                 self._close_position(strategy, ts, raw_exit, reason)
 
+    def _apply_financing(self, ts: pd.Timestamp) -> float:
+        total = 0.0
+        for strategy, position in self.state.positions.items():
+            start = position.last_financing_time or position.entry_time
+            accrual = financing_between(
+                start,
+                ts,
+                side=position.side,
+                lots=position.lots,
+                schedule=self.config.financing,
+            )
+            position.last_financing_time = ts.isoformat()
+            if accrual.cash == 0.0:
+                continue
+            position.financing_accrued += accrual.cash
+            self.state.balance += accrual.cash
+            self.state.total_financing += accrual.cash
+            total += accrual.cash
+            self.events.append(
+                time=ts.isoformat(),
+                event="FINANCING",
+                strategy=strategy,
+                side=position.side,
+                lots=position.lots,
+                expected_price="",
+                fill_price="",
+                slippage_pips="",
+                pnl=accrual.cash,
+                balance=self.state.balance,
+                equity=self.state.equity,
+                reason=(
+                    f"rollovers={accrual.rollovers};"
+                    f"weighted_rollovers={accrual.weighted_rollovers:g};"
+                    "synthetic_account_cash"
+                ),
+            )
+        return float(total)
+
     def _apply_risk_gate(self, ts: pd.Timestamp, close: float) -> None:
         self._mark_to_market(close)
+        if self.state.halted:
+            return
         killed, reason = kill_switch_triggered(
             self.state.start_of_day_equity,
             self.state.peak_equity,
@@ -368,6 +420,50 @@ class PaperTradingEngine:
             reason=reason,
         )
 
+    def warm_start(self, bars: pd.DataFrame) -> dict[str, Any]:
+        """Seed a fresh forward-paper cursor without replaying historical bars.
+
+        MT5 history is indicator context only on the first paper poll. No historical
+        SIGNAL, ENTRY or EXIT event is created. Existing initialized state is left
+        untouched so restarts preserve the normal idempotent cursor semantics.
+        """
+        required = {"open", "high", "low", "close"}
+        missing = required.difference(bars.columns)
+        if missing:
+            raise ValueError(f"missing OHLC columns: {sorted(missing)}")
+        if bars.empty:
+            return self.snapshot()
+        if not isinstance(bars.index, pd.DatetimeIndex):
+            raise ValueError("paper bars require a DatetimeIndex")
+        if self.state.last_bar_time is not None:
+            return self.snapshot()
+        if self.state.positions or self.state.pending_signals:
+            raise RuntimeError("cannot warm-start an uninitialized paper state with execution state")
+
+        ordered = bars.sort_index()
+        latest_ts = pd.Timestamp(ordered.index[-1])
+        latest_close = float(ordered.iloc[-1]["close"])
+        self.state.current_day = latest_ts.date().isoformat()
+        self.state.start_of_day_equity = self.state.equity
+        self.state.last_bar_time = latest_ts.isoformat()
+        self._mark_to_market(latest_close)
+        self.store.save(self.state)
+        self.events.append(
+            time=datetime.now(timezone.utc).isoformat(),
+            event="WARM_START",
+            strategy="PORTFOLIO",
+            side="",
+            lots="",
+            expected_price=latest_close,
+            fill_price="",
+            slippage_pips="",
+            pnl="",
+            balance=self.state.balance,
+            equity=self.state.equity,
+            reason=f"forward_only_seed;latest_completed_bar={latest_ts.isoformat()};history_bars={len(ordered)}",
+        )
+        return self.snapshot()
+
     def process(self, bars: pd.DataFrame) -> dict[str, Any]:
         required = {"open", "high", "low", "close"}
         missing = required.difference(bars.columns)
@@ -392,6 +488,9 @@ class PaperTradingEngine:
             if day != self.state.current_day:
                 self.state.current_day = day
                 self.state.start_of_day_equity = self.state.equity
+
+            self._apply_financing(ts)
+            self._apply_risk_gate(ts, float(row["open"]))
 
             if not self.state.halted:
                 self._execute_pending_at_open(ts, float(row["open"]))
@@ -440,6 +539,8 @@ class PaperTradingEngine:
             "balance": self.state.balance,
             "equity": self.state.equity,
             "peak_equity": self.state.peak_equity,
+            "total_financing": self.state.total_financing,
+            "financing_enabled": bool(self.config.financing.enabled),
             "halted": self.state.halted,
             "halt_reason": self.state.halt_reason,
             "last_bar_time": self.state.last_bar_time,

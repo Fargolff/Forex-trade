@@ -9,6 +9,8 @@ venv/
 config.yaml
 production.yaml
 watchdog.yaml
+backup.yaml
+reconcile.yaml
 runtime/
 backups/
 results/
@@ -17,6 +19,13 @@ data/
 # Secrets / local environment
 .env
 .env.*
+release/*private*.pem
+*.release-private.pem
+*.key
+
+# Generated release artifacts
+release/*.zip
+release/*bundle*.signature.json
 
 # OS/editor
 .DS_Store

@@ -75,6 +75,7 @@ def _backtest_config(cfg) -> BacktestConfig:
         spread_pips=cfg.spread_pips,
         slippage_pips=cfg.slippage_pips,
         commission_per_lot_round_turn=cfg.commission_per_lot_round_turn,
+        financing=cfg.financing,
         periods_per_year=_periods_per_year(cfg.timeframe),
     )
 
@@ -88,6 +89,7 @@ def _paper_config(cfg, args) -> PaperConfig:
         spread_pips=cfg.spread_pips,
         slippage_pips=cfg.slippage_pips,
         commission_per_lot_round_turn=cfg.commission_per_lot_round_turn,
+        financing=cfg.financing,
         state_path=args.paper_state or cfg.paper.state_path,
         events_path=args.paper_events or cfg.paper.events_path,
     )
@@ -103,8 +105,27 @@ def _live_config(cfg, args) -> LiveEngineConfig:
         max_total_lots=cfg.live.max_total_lots,
         max_open_positions=cfg.live.max_open_positions,
         max_spread_pips=cfg.live.max_spread_pips,
+        allowed_account_logins=tuple(cfg.live.allowed_account_logins),
+        require_account_allowlist=cfg.live.require_account_allowlist,
+        max_margin_fraction_of_equity=cfg.live.max_margin_fraction_of_equity,
+        min_free_margin_fraction_after_order=cfg.live.min_free_margin_fraction_after_order,
         max_tick_age_seconds=cfg.live.max_tick_age_seconds,
         max_bar_age_seconds=max_bar_age,
+        market_session_enabled=cfg.live.market_session_enabled,
+        market_sunday_open_utc=cfg.live.market_sunday_open_utc,
+        market_friday_close_utc=cfg.live.market_friday_close_utc,
+        market_transition_grace_seconds=cfg.live.market_transition_grace_seconds,
+        max_future_tick_seconds=cfg.live.max_future_tick_seconds,
+        max_future_bar_seconds=cfg.live.max_future_bar_seconds,
+        session_calibration_enabled=cfg.live.session_calibration_enabled,
+        session_calibration_state_path=cfg.live.session_calibration_state_path,
+        session_calibration_min_samples=cfg.live.session_calibration_min_samples,
+        session_calibration_safety_buffer_minutes=cfg.live.session_calibration_safety_buffer_minutes,
+        session_calibration_max_narrowing_minutes=cfg.live.session_calibration_max_narrowing_minutes,
+        session_calibration_retention_weeks=cfg.live.session_calibration_retention_weeks,
+        clock_watchdog_window_size=cfg.live.clock_watchdog_window_size,
+        clock_watchdog_min_samples=cfg.live.clock_watchdog_min_samples,
+        max_persistent_clock_offset_seconds=cfg.live.max_persistent_clock_offset_seconds,
         deal_reconcile_lookback_hours=cfg.live.deal_reconcile_lookback_hours,
         magic=cfg.live.magic,
         deviation_points=cfg.live.deviation_points,
@@ -221,8 +242,20 @@ def _print_operational_report(report: dict) -> None:
     print(f"Spread                 : {report['spread_pips']:.2f} pips")
     print(f"Tick age               : {report['tick_age_seconds']:.1f}s")
     print(f"Completed-bar age      : {report['bar_age_seconds']:.1f}s")
+    print(f"Market state           : {report.get('market_state', 'UNKNOWN')}")
+    print(f"Market reason          : {report.get('market_reason', '')}")
+    print(f"Next transition UTC    : {report.get('next_market_transition_utc')}")
+    print(f"Tick clock offset      : {report.get('tick_clock_offset_seconds')}s")
+    print(f"Bar clock offset       : {report.get('bar_clock_offset_seconds')}s")
     print(f"Managed positions      : {len(report['positions'])}")
     print(f"Account equity         : {report['account'].equity:.2f} {report['account'].currency}")
+    swap = report.get("broker_swap_terms") or {}
+    if swap:
+        print(
+            "Broker swap raw        : "
+            f"long={swap.get('long')} short={swap.get('short')} "
+            f"mode={swap.get('mode')} rollover3days={swap.get('rollover3days')}"
+        )
     if report["incidents"]:
         print("Incidents:")
         for item in report["incidents"]:
@@ -234,6 +267,8 @@ def _print_operational_report(report: dict) -> None:
 def _run_paper_mt5_once(cfg, args, engine: PaperTradingEngine) -> dict:
     history_bars = args.paper_history_bars or cfg.paper.history_bars
     completed = _mt5_completed_data(cfg, history_bars)
+    if engine.state.last_bar_time is None:
+        return engine.warm_start(completed)
     return engine.process(completed)
 
 
@@ -404,6 +439,12 @@ def main() -> None:
                 completed.index[-1],
                 max_tick_age_seconds=live_cfg.max_tick_age_seconds,
                 max_bar_age_seconds=live_cfg.max_bar_age_seconds,
+                market_session_enabled=live_cfg.market_session_enabled,
+                market_sunday_open_utc=live_cfg.market_sunday_open_utc,
+                market_friday_close_utc=live_cfg.market_friday_close_utc,
+                market_transition_grace_seconds=live_cfg.market_transition_grace_seconds,
+                max_future_tick_seconds=live_cfg.max_future_tick_seconds,
+                max_future_bar_seconds=live_cfg.max_future_bar_seconds,
             )
             _print_operational_report(report)
         finally:
