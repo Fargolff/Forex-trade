@@ -32,30 +32,38 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "pandas>=2.2" "numpy>=2.0" "PyYAML>=6.0" "cryptography>=43.0" "pytest>=8.0"
 
-      - name: Apply Phase 35
-        run: python tools/phase35_apply_v2.py
-
-      - name: Run Phase 35 tests
+      - name: Apply and validate Phase 35
         env:
           PYTHONPATH: .
-        run: python -m pytest -q tests/test_phase35_watcher_quorum.py
-
-      - name: Run full tests
-        env:
-          PYTHONPATH: .
-        run: python -m pytest -q
-
-      - name: Run operational soak
-        env:
-          PYTHONPATH: .
-        run: python -m src.soak --cycles 300
-
-      - name: Commit validated Phase 35 source
         run: |
+          set +e
+          : > /tmp/phase35_debug.log
+          python tools/phase35_apply_v2.py >> /tmp/phase35_debug.log 2>&1
+          rc=$?
+          if [ $rc -eq 0 ]; then
+            python -m pytest -q tests/test_phase35_watcher_quorum.py >> /tmp/phase35_debug.log 2>&1
+            rc=$?
+          fi
+          if [ $rc -eq 0 ]; then
+            python -m pytest -q >> /tmp/phase35_debug.log 2>&1
+            rc=$?
+          fi
+          if [ $rc -eq 0 ]; then
+            python -m src.soak --cycles 300 >> /tmp/phase35_debug.log 2>&1
+            rc=$?
+          fi
+          cat /tmp/phase35_debug.log
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ $rc -ne 0 ]; then
+            git reset --hard HEAD
+            cp /tmp/phase35_debug.log tools/phase35_debug.log
+            git add tools/phase35_debug.log
+            git commit -m "chore: capture Phase 35 validation failure"
+            git push origin HEAD:codex/phase11-signed-release-gate
+            exit $rc
+          fi
+          rm -f tools/phase35_debug.log
           git add .gitignore src/watcher_quorum.py tests/test_phase35_watcher_quorum.py docs/phase35-watcher-quorum.md watcher_quorum.example.yaml watcher_quorum_trust.example.yaml deploy/windows/run-remote-watcher.ps1 deploy/windows/run-watcher-quorum-verify.ps1
           git commit -m "feat: add multi-observer watcher quorum Phase 35"
           git push origin HEAD:codex/phase11-signed-release-gate
-
-# Trigger Phase 35 after all payload parts are present.
