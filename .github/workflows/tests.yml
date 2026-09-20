@@ -5,6 +5,10 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   pytest:
@@ -34,3 +38,62 @@ jobs:
         env:
           PYTHONPATH: .
         run: python -m src.soak --cycles 300
+
+      - name: Create signed CI attestation
+        id: ci_attestation
+        if: ${{ github.event_name != 'pull_request' }}
+        env:
+          CI_PRIVATE_KEY_B64: ${{ secrets.FOREX_CI_ATTESTATION_PRIVATE_KEY_B64 }}
+          SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "CI attestation skipped: release attestations are main-only."
+            echo "created=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "$CI_PRIVATE_KEY_B64" ]; then
+            echo "CI attestation skipped: FOREX_CI_ATTESTATION_PRIVATE_KEY_B64 is not configured."
+            echo "created=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ ! -f release/forex-ci-attestation-public.pem ]; then
+            echo "::error::CI attestation secret is configured but release/forex-ci-attestation-public.pem is missing."
+            exit 1
+          fi
+          printf '%s' "$CI_PRIVATE_KEY_B64" | base64 --decode > "$RUNNER_TEMP/forex-ci-attestation-private.pem"
+          chmod 600 "$RUNNER_TEMP/forex-ci-attestation-private.pem"
+          python -m src.ci_attestation \
+            --mode create \
+            --root . \
+            --source-commit "$SOURCE_COMMIT" \
+            --repository "$GITHUB_REPOSITORY" \
+            --workflow "$GITHUB_WORKFLOW" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --event-name "$GITHUB_EVENT_NAME" \
+            --ref "$GITHUB_REF" \
+            --soak-cycles 300
+          python -m src.ci_attestation \
+            --mode sign \
+            --root . \
+            --private-key "$RUNNER_TEMP/forex-ci-attestation-private.pem"
+          python -m src.ci_attestation \
+            --mode verify \
+            --root . \
+            --expected-source-commit "$SOURCE_COMMIT" \
+            --expected-repository "$GITHUB_REPOSITORY" \
+            --expected-workflow "$GITHUB_WORKFLOW" \
+            --soak-cycles 300
+          rm -f "$RUNNER_TEMP/forex-ci-attestation-private.pem"
+          echo "created=true" >> "$GITHUB_OUTPUT"
+
+      - name: Upload signed CI attestation
+        if: ${{ steps.ci_attestation.outputs.created == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: forex-ci-attestation-${{ github.sha }}
+          path: |
+            release/ci_attestation.json
+            release/ci_attestation.signature.json
+          retention-days: 30
