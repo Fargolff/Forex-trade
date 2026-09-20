@@ -7,6 +7,7 @@ on:
     paths:
       - .github/workflows/phase35-apply.yml
       - tools/phase35_apply.py
+      - tools/phase35_apply_v2.py
 
 permissions:
   contents: write
@@ -32,7 +33,7 @@ jobs:
           python -m pip install "pandas>=2.2" "numpy>=2.0" "PyYAML>=6.0" "cryptography>=43.0" "pytest>=8.0"
 
       - name: Apply Phase 35
-        run: python tools/phase35_apply.py
+        run: python tools/phase35_apply_v2.py
 
       - name: Run Phase 35 tests
         env:
