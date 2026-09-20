@@ -12,3 +12,15 @@ if old not in text and new not in text:
     raise RuntimeError('Phase 33 publish marker not found')
 text = text.replace(old, new, 1)
 path.write_text(text, encoding='utf-8')
+
+# The production publisher now imports runtime_liveness lazily, so the regression
+# must patch the module function that will be imported at call time rather than
+# a removed production-module alias.
+test_path = Path('tests/test_phase33_runtime_liveness.py')
+test_text = test_path.read_text(encoding='utf-8')
+old_test = '''    monkeypatch.setattr(production, "append_liveness_from_env", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("remote unavailable")))\n'''
+new_test = '''    monkeypatch.setattr(liveness, "append_liveness_from_env", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("remote unavailable")))\n'''
+if old_test not in test_text and new_test not in test_text:
+    raise RuntimeError('Phase 33 lazy-import test marker not found')
+test_text = test_text.replace(old_test, new_test, 1)
+test_path.write_text(test_text, encoding='utf-8')
