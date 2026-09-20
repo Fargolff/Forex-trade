@@ -1,0 +1,15 @@
+observer_id: watcher-bkk-a
+environment_id: prod-bkk-01
+machine_id: trader-pc-01
+quorum_root: 'Z:/ForexWatcherQuorum'
+expected_observers:
+  - watcher-bkk-a
+  - watcher-bkk-b
+  - watcher-sgp-a
+quorum_size: 2
+trust_path: watcher_quorum_trust.yaml
+state_path: runtime/watcher_quorum_state.json
+private_key_env: FOREX_WATCHER_ATTESTATION_PRIVATE_KEY
+witness_depth: 32
+max_attestation_age_seconds: 180
+max_clock_skew_seconds: 60

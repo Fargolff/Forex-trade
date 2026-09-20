@@ -9,9 +9,11 @@ venv/
 config.yaml
 production.yaml
 watchdog.yaml
-remote_watcher.yaml
 backup.yaml
 reconcile.yaml
+remote_watcher.yaml
+watcher_quorum.yaml
+watcher_quorum_trust.yaml
 runtime/
 backups/
 results/
