@@ -6,6 +6,7 @@ on:
       - codex/phase11-signed-release-gate
     paths:
       - tools/phase33_apply.py
+      - tools/phase33_fix.py
       - .github/workflows/phase33-apply.yml
 
 permissions:
@@ -32,7 +33,9 @@ jobs:
           python -m pip install "pandas>=2.2" "numpy>=2.0" "PyYAML>=6.0" "cryptography>=43.0" "pytest>=8.0"
 
       - name: Apply Phase 33
-        run: python tools/phase33_apply.py
+        run: |
+          python tools/phase33_apply.py
+          python tools/phase33_fix.py
 
       - name: Run tests
         env:
