@@ -1,0 +1,17 @@
+observer_id: watcher-pc-01
+environment_id: prod-bkk-01
+machine_id: trader-pc-01
+replica_root: "Z:/forex-audit"
+replica_subdir: forex-runtime-audit
+trust_store_path: release/signing_key_trust.json
+state_path: runtime/remote_watcher_state.json
+outbox_path: runtime/remote_watcher_alerts.jsonl
+warning_after_seconds: 120
+critical_after_seconds: 300
+repeat_warning_seconds: 1800
+repeat_critical_seconds: 600
+webhook_env: FOREX_WATCHER_ALERT_WEBHOOK_URL
+webhook_timeout_seconds: 5
+recovery_notifications: true
+max_outbox_bytes: 5000000
+outbox_backups: 5
