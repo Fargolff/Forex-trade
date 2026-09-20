@@ -23,6 +23,8 @@ from .mt5_broker import BrokerPosition, BrokerTick, MT5Broker, SymbolSpec
 from .ops import operational_report
 from .paper import load_portfolio_bundle
 
+RUNTIME_LIVENESS_REQUIRE_ENV = "FOREX_REQUIRE_RUNTIME_LIVENESS_LEDGER"
+
 
 @dataclass(frozen=True)
 class ProductionConfig:
@@ -520,6 +522,132 @@ def _print_guard(report: dict[str, Any]) -> None:
         print("Incidents                      : none")
 
 
+
+class RuntimeLivenessError(RuntimeError):
+    pass
+
+
+def _runtime_liveness_enabled() -> bool:
+    raw = os.getenv(RUNTIME_LIVENESS_REQUIRE_ENV, "").strip().lower()
+    if not raw:
+        return False
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeLivenessError(f"{RUNTIME_LIVENESS_REQUIRE_ENV} must be 0/1/true/false")
+
+
+def _safe_number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except Exception:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _runtime_liveness_health(
+    *,
+    stage: str,
+    symbol: str,
+    report: dict[str, Any] | None,
+    snapshot: dict[str, Any] | None,
+    production_halt: dict[str, Any] | None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    report = report or {}
+    ops = report.get("ops") if isinstance(report.get("ops"), dict) else {}
+    account = ops.get("account")
+    positions = list(ops.get("positions") or [])
+    incident_rows = report.get("incidents") if isinstance(report.get("incidents"), list) else []
+    incidents = []
+    for item in incident_rows:
+        if isinstance(item, dict):
+            incidents.append({
+                "severity": str(item.get("severity", "")),
+                "code": str(item.get("code", "")),
+            })
+    stage_name = str(stage).upper()
+    status = str(report.get("status") or "OK").upper()
+    if stage_name == "DEGRADED":
+        status = "DEGRADED"
+    elif stage_name == "HALTED":
+        status = "HALTED"
+    elif stage_name == "ERROR":
+        status = "ERROR"
+    live = snapshot or {}
+    payload = {
+        "status": status,
+        "symbol": symbol,
+        "market_state": ops.get("market_state"),
+        "market_reason": ops.get("market_reason"),
+        "spread_pips": _safe_number(ops.get("spread_pips")),
+        "tick_age_seconds": _safe_number(ops.get("tick_age_seconds")),
+        "bar_age_seconds": _safe_number(ops.get("bar_age_seconds")),
+        "account": {
+            "login": int(getattr(account, "login", 0) or 0) if account is not None else 0,
+            "balance": _safe_number(getattr(account, "balance", None)) if account is not None else None,
+            "equity": _safe_number(getattr(account, "equity", None)) if account is not None else None,
+            "margin_free": _safe_number(getattr(account, "margin_free", None)) if account is not None else None,
+            "margin_level": _safe_number(getattr(account, "margin_level", None)) if account is not None else None,
+        },
+        "managed_positions": {
+            "count": len(positions),
+            "total_lots": _safe_number(sum(float(getattr(item, "volume", 0.0) or 0.0) for item in positions)),
+        },
+        "incidents": incidents,
+        "live": {
+            "halted": bool(live.get("halted", False)),
+            "halt_reason": live.get("halt_reason"),
+            "last_bar_time": live.get("last_bar_time"),
+            "last_deal_time_msc": int(live.get("last_deal_time_msc", 0) or 0),
+            "last_deal_ticket": int(live.get("last_deal_ticket", 0) or 0),
+            "pending_order_intent_id": live.get("pending_order_intent_id"),
+            "managed_positions": int(live.get("managed_positions", 0) or 0),
+            "managed_total_lots": _safe_number(live.get("managed_total_lots")),
+        },
+        "production_halt": production_halt,
+    }
+    if extra:
+        payload["extra"] = extra
+    return payload
+
+
+def _publish_runtime_liveness(
+    *,
+    stage: str,
+    cycle: int,
+    symbol: str,
+    report: dict[str, Any] | None,
+    snapshot: dict[str, Any] | None,
+    production_halt: dict[str, Any] | None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    if not _runtime_liveness_enabled():
+        return None
+    health = _runtime_liveness_health(
+        stage=stage,
+        symbol=symbol,
+        report=report,
+        snapshot=snapshot,
+        production_halt=production_halt,
+        extra=extra,
+    )
+    try:
+        # Lazy import avoids the existing recovery -> production dependency
+        # from becoming a production -> liveness -> recovery cycle.
+        from .runtime_liveness import append_liveness_from_env
+
+        return append_liveness_from_env(
+            Path.cwd(),
+            stage=stage,
+            cycle=cycle,
+            health=health,
+        )
+    except Exception as exc:
+        raise RuntimeLivenessError(f"runtime liveness checkpoint failed: {exc}") from exc
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Phase 9 production observability/supervision")
     parser.add_argument("--config", default="config.yaml")
@@ -568,6 +696,10 @@ def main() -> None:
         if report["status"] == "CRITICAL":
             _alert_incidents(alerts, report, app_cfg.symbol)
             halt_store.halt("PRODUCTION_GUARD", ";".join(item["code"] for item in report["incidents"] if item["severity"] == "CRITICAL"))
+            _publish_runtime_liveness(
+                stage="HALTED", cycle=0, symbol=app_cfg.symbol, report=report,
+                snapshot=None, production_halt=halt_store.load(),
+            )
             raise RuntimeError("production guard is CRITICAL; live engine not started")
 
         engine = LiveTradingEngine(
@@ -584,6 +716,8 @@ def main() -> None:
         while args.max_cycles == 0 or cycles < args.max_cycles:
             cycles += 1
             rotate_runtime_logs(app_cfg, prod_cfg)
+            report = None
+            snapshot = None
             try:
                 completed = _completed_from_broker(broker, app_cfg.symbol, app_cfg.timeframe, app_cfg.live.history_bars)
                 report = production_guard_report(broker, app_cfg, prod_cfg, strategies, completed, metrics)
@@ -592,14 +726,28 @@ def main() -> None:
                     codes = ",".join(item["code"] for item in report["incidents"] if item["severity"] == "CRITICAL")
                     halt_store.halt("PRODUCTION_GUARD", codes)
                     alerts.emit("CRITICAL", "PRODUCTION_HALT", codes, {"cycle": cycles})
+                    _publish_runtime_liveness(
+                        stage="HALTED", cycle=cycles, symbol=app_cfg.symbol, report=report,
+                        snapshot=engine.snapshot(), production_halt=halt_store.load(),
+                    )
                     break
                 if report["status"] == "WARN":
+                    _publish_runtime_liveness(
+                        stage="DEGRADED", cycle=cycles, symbol=app_cfg.symbol, report=report,
+                        snapshot=engine.snapshot(), production_halt=halt_store.load(),
+                    )
                     metrics.save()
                     if args.max_cycles and cycles >= args.max_cycles:
                         break
                     time.sleep(poll_seconds)
                     continue
 
+                # Phase 33 fail-closed gate: prove the remote liveness ledger is
+                # writable and chained before this cycle can evaluate/send orders.
+                _publish_runtime_liveness(
+                    stage="READY", cycle=cycles, symbol=app_cfg.symbol, report=report,
+                    snapshot=engine.snapshot(), production_halt=halt_store.load(),
+                )
                 snapshot = engine.process_latest(completed)
                 slippage_samples = reconcile_slippage_samples(app_cfg.live.events_path, report["ops"]["symbol_spec"].pip_size, metrics)
                 for sample in slippage_samples:
@@ -613,9 +761,29 @@ def main() -> None:
                         snapshot["halted"] = True
                 metrics.save()
                 if snapshot.get("halted"):
+                    _publish_runtime_liveness(
+                        stage="HALTED", cycle=cycles, symbol=app_cfg.symbol, report=report,
+                        snapshot=snapshot, production_halt=halt_store.load(),
+                    )
                     alerts.emit("CRITICAL", "LIVE_ENGINE_HALTED", str(snapshot.get("halt_reason") or "production halt"))
                     break
+            except RuntimeLivenessError as exc:
+                detail = str(exc)
+                halt_store.halt("RUNTIME_LIVENESS_FAILED", detail)
+                alerts.emit("CRITICAL", "RUNTIME_LIVENESS_FAILED", detail, {"cycle": cycles})
+                break
             except Exception as exc:
+                try:
+                    _publish_runtime_liveness(
+                        stage="ERROR", cycle=cycles, symbol=app_cfg.symbol, report=report,
+                        snapshot=snapshot, production_halt=halt_store.load(),
+                        extra={"exception": str(exc)},
+                    )
+                except RuntimeLivenessError as liveness_exc:
+                    detail = str(liveness_exc)
+                    halt_store.halt("RUNTIME_LIVENESS_FAILED", detail)
+                    alerts.emit("CRITICAL", "RUNTIME_LIVENESS_FAILED", detail, {"cycle": cycles})
+                    break
                 alerts.emit("CRITICAL", "LIVE_RUNTIME_ERROR", str(exc), {"cycle": cycles})
                 if not _reconnect(broker, prod_cfg, alerts):
                     halt_store.halt("RECONNECT_EXHAUSTED", str(exc))

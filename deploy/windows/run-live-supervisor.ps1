@@ -180,6 +180,23 @@ if ([string]::IsNullOrWhiteSpace($AuditLedgerSubdir)) {
     $AuditLedgerSubdir = "Forex-trade/audit-ledger"
 }
 
+# Phase 33 extends Phase 32 with signed runtime checkpoints during every
+# supervised-live cycle. It defaults on whenever the remote audit ledger is on.
+$RequireRuntimeLivenessRaw = [string]$env:FOREX_REQUIRE_RUNTIME_LIVENESS_LEDGER
+if ([string]::IsNullOrWhiteSpace($RequireRuntimeLivenessRaw)) {
+    $RuntimeLivenessEnabled = $RemoteAuditEnabled
+} else {
+    $RuntimeLivenessEnabled = @("1", "true", "yes", "on") -contains $RequireRuntimeLivenessRaw.ToLowerInvariant()
+}
+if ($RuntimeLivenessEnabled -and -not $RemoteAuditEnabled) {
+    throw "FOREX_REQUIRE_RUNTIME_LIVENESS_LEDGER requires the Phase 32 remote audit ledger."
+}
+if ($RuntimeLivenessEnabled) {
+    $env:FOREX_REQUIRE_RUNTIME_LIVENESS_LEDGER = "1"
+} else {
+    $env:FOREX_REQUIRE_RUNTIME_LIVENESS_LEDGER = "0"
+}
+
 # Phase 14 broker/local restart reconciliation is fail-closed by default. A
 # temporary migration bypass requires the operator to explicitly set this to 0.
 $RestartReconcileRaw = [string]$env:FOREX_REQUIRE_RESTART_RECONCILE

@@ -625,3 +625,8 @@ Production supervisor starts/restarts can now create a fresh Ed25519-signed boot
 
 Every fresh Phase 31 boot receipt can now be replicated to an off-device, application-level append-only ledger before supervised live starts. Each remote entry preserves the signed boot receipt, deployment approval, release receipt and detached signatures, plus a runtime-boot-signed ledger manifest. Continuation entries must match both the previous remote manifest hash and the previous signed boot-receipt hash; forks, collisions, replay, missing entries, remote tamper and head inconsistencies fail closed. Configure `FOREX_AUDIT_LEDGER_ROOT` to a real external share/storage gateway; storage-side WORM/Object Lock is recommended for protection against privileged remote deletion. See `docs/phase32-audit-ledger.md`.
 
+
+
+## Phase 33 — Runtime Heartbeat Attestation & Remote Liveness Ledger
+
+Supervised live can now publish Ed25519-signed runtime checkpoints into the Phase 32 off-device audit scope. A healthy cycle writes a `READY` checkpoint **before** `engine.process_latest()` so required remote-audit failure blocks the cycle before order evaluation. WARN/CRITICAL/runtime-error paths publish `DEGRADED`, `HALTED`, or `ERROR` evidence when possible. Each checkpoint is chained to the previous checkpoint and anchored to the exact current Phase 32 boot-audit manifest and Phase 31 boot-receipt hash. `FOREX_REQUIRE_RUNTIME_LIVENESS_LEDGER` defaults on in the Windows supervisor whenever the remote audit ledger is enabled. See `docs/phase33-runtime-liveness.md`.
