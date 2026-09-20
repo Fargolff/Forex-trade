@@ -1,4 +1,4 @@
 Traceback (most recent call last):
-  File "/home/runner/work/Forex-trade/Forex-trade/tools/phase35_apply_v2.py", line 20, in <module>
+  File "/home/runner/work/Forex-trade/Forex-trade/tools/phase35_apply_v2.py", line 56, in <module>
     raise RuntimeError(
-RuntimeError: Phase 35 payload transport checksum mismatch: length=15111 expected_length=15828 sha256=ffd5e5580f1a8f54d7ce5451ed49aea4fa373b24c71956fcb412b6d01fd7175e expected_sha256=691b383d40978048011be324b7a8bfc907cc6950d07bfdd882d02d86b6326438
+RuntimeError: Phase 35 payload transport checksum mismatch: expected_length=15828 expected_sha256=691b383d40978048011be324b7a8bfc907cc6950d07bfdd882d02d86b6326438; parts:length=15111 sha256=ffd5e5580f1a8f54d7ce5451ed49aea4fa373b24c71956fcb412b6d01fd7175e ok=False; v1:length=15827 sha256=c783dabc18e665499b7e5bcc9f604d4ff0d9bfd7dbe42fc17d7c416680b4d04e ok=False
