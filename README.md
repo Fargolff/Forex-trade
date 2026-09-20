@@ -621,3 +621,7 @@ Production deployment now has a separate authorization layer after the signed re
 
 Production supervisor starts/restarts can now create a fresh Ed25519-signed boot receipt after release, provenance, deployment-approval, and restart-reconciliation gates pass. The receipt binds the exact environment, machine ID, approved release, portfolio design fingerprint, approval/release artifact hashes, runtime boot key identity, and previous boot-receipt hash. Receipts older than five minutes are rejected at startup and each boot is archived under `runtime/boot_attestations/` for audit. Runtime boot keys use the dedicated `runtime_boot` trust role and cannot sign releases or deployment approvals. Live trading remains disabled by default and still requires the exact arm phrase.
 
+## Phase 32 — Remote Audit Ledger & Boot Receipt Replication
+
+Every fresh Phase 31 boot receipt can now be replicated to an off-device, application-level append-only ledger before supervised live starts. Each remote entry preserves the signed boot receipt, deployment approval, release receipt and detached signatures, plus a runtime-boot-signed ledger manifest. Continuation entries must match both the previous remote manifest hash and the previous signed boot-receipt hash; forks, collisions, replay, missing entries, remote tamper and head inconsistencies fail closed. Configure `FOREX_AUDIT_LEDGER_ROOT` to a real external share/storage gateway; storage-side WORM/Object Lock is recommended for protection against privileged remote deletion. See `docs/phase32-audit-ledger.md`.
+

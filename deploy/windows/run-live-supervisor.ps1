@@ -158,6 +158,28 @@ if ([string]::IsNullOrWhiteSpace($RuntimeBootSignature)) {
     $RuntimeBootSignature = "runtime/runtime_boot_receipt.signature.json"
 }
 
+# Phase 32 replicates the fresh signed boot evidence to an external append-only
+# audit ledger. It defaults on whenever Phase 31 runtime boot attestation is on.
+$RequireRemoteAuditRaw = [string]$env:FOREX_REQUIRE_REMOTE_AUDIT_LEDGER
+if ([string]::IsNullOrWhiteSpace($RequireRemoteAuditRaw)) {
+    $RemoteAuditEnabled = $RuntimeBootEnabled
+} else {
+    $RemoteAuditEnabled = @("1", "true", "yes", "on") -contains $RequireRemoteAuditRaw.ToLowerInvariant()
+}
+if ($RemoteAuditEnabled -and -not $RuntimeBootEnabled) {
+    throw "FOREX_REQUIRE_REMOTE_AUDIT_LEDGER requires Phase 31 runtime boot attestation."
+}
+
+$AuditLedgerRoot = [string]$env:FOREX_AUDIT_LEDGER_ROOT
+if ($RemoteAuditEnabled -and [string]::IsNullOrWhiteSpace($AuditLedgerRoot)) {
+    throw "FOREX_AUDIT_LEDGER_ROOT is required when remote audit replication is enabled."
+}
+
+$AuditLedgerSubdir = [string]$env:FOREX_AUDIT_LEDGER_SUBDIR
+if ([string]::IsNullOrWhiteSpace($AuditLedgerSubdir)) {
+    $AuditLedgerSubdir = "Forex-trade/audit-ledger"
+}
+
 # Phase 14 broker/local restart reconciliation is fail-closed by default. A
 # temporary migration bypass requires the operator to explicitly set this to 0.
 $RestartReconcileRaw = [string]$env:FOREX_REQUIRE_RESTART_RECONCILE
@@ -329,6 +351,47 @@ function Write-RuntimeBootAttestation {
     }
 }
 
+function Write-RemoteAuditLedger {
+    if (-not $RemoteAuditEnabled) {
+        Write-Warning "Phase 32 remote audit ledger is explicitly disabled by FOREX_REQUIRE_REMOTE_AUDIT_LEDGER."
+        return
+    }
+
+    & $Python -m src.audit_ledger `
+        --mode append `
+        --root $ProjectRoot `
+        --environment-id $DeploymentEnvironmentId `
+        --machine-id $RuntimeMachineId `
+        --private-key $RuntimeBootPrivateKey `
+        --replica-root $AuditLedgerRoot `
+        --replica-subdir $AuditLedgerSubdir `
+        --boot-receipt $RuntimeBootReceipt `
+        --boot-signature $RuntimeBootSignature `
+        --approval $DeploymentApprovalPath `
+        --approval-signature $DeploymentApprovalSignature `
+        --release-receipt $ReleaseReceipt `
+        --release-receipt-signature $ReleaseReceiptSignature `
+        --trust-store $SigningKeyTrustStore `
+        --max-boot-age-seconds 300
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Remote audit ledger append failed. Supervised live will not start."
+    }
+
+    & $Python -m src.audit_ledger `
+        --mode verify `
+        --root $ProjectRoot `
+        --environment-id $DeploymentEnvironmentId `
+        --machine-id $RuntimeMachineId `
+        --replica-root $AuditLedgerRoot `
+        --replica-subdir $AuditLedgerSubdir `
+        --trust-store $SigningKeyTrustStore
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Remote audit ledger verification failed. Supervised live will not start."
+    }
+}
+
 function Test-RestartReconciliation {
     if (-not $RestartReconcileEnabled) {
         Write-Warning "Phase 14 restart reconciliation is explicitly disabled by FOREX_REQUIRE_RESTART_RECONCILE."
@@ -365,6 +428,7 @@ while ($Restarts -le $MaxRestarts) {
     Test-DeploymentApproval
     Test-RestartReconciliation
     Write-RuntimeBootAttestation
+    Write-RemoteAuditLedger
 
     & $Python -m src.production --mode supervised-live --arm-live $ArmPhrase
     $ExitCode = $LASTEXITCODE
