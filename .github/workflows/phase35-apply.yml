@@ -57,3 +57,5 @@ jobs:
           git add .gitignore src/watcher_quorum.py tests/test_phase35_watcher_quorum.py docs/phase35-watcher-quorum.md watcher_quorum.example.yaml watcher_quorum_trust.example.yaml deploy/windows/run-remote-watcher.ps1 deploy/windows/run-watcher-quorum-verify.ps1
           git commit -m "feat: add multi-observer watcher quorum Phase 35"
           git push origin HEAD:codex/phase11-signed-release-gate
+
+# Trigger Phase 35 after all payload parts are present.
