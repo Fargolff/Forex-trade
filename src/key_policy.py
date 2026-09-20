@@ -15,7 +15,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 TRUST_STORE_FORMAT = "forex-auto-trader-signing-key-trust-store"
 TRUST_STORE_VERSION = 1
 DEFAULT_TRUST_STORE = "release/signing_key_trust.json"
-ALLOWED_ROLES = {"release", "ci_attestation"}
+ALLOWED_ROLES = {"release", "ci_attestation", "deployment_approval"}
 _KEY_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 

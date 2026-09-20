@@ -611,3 +611,8 @@ Production release signing now requires a separately signed CI attestation for t
 
 Production signing now supports a versioned trust store (`release/signing_key_trust.json`) with stable `key_id` values, validity windows, overlapping rotations, and hard revocation. New release/CI signature documents use version 2 and embed the selected `key_id`; expired keys cannot create new signatures, signatures made before planned expiry remain historically verifiable, while revoked keys fail closed even for historical verification. The trust store and `release/keys/*.pem` are included in deployment/source-tree provenance so post-CI trust changes invalidate the attestation. See `docs/phase29-key-rotation.md` and `signing_key_trust.example.json`.
 
+
+
+## Phase 30 — Release Promotion & Deployment Approval Gate
+
+Production deployment now has a separate authorization layer after the signed release ceremony. `src.deployment_approval` promotes a release through **BUILT → VERIFIED → APPROVED → DEPLOYABLE** and binds the approval to an exact environment ID, release receipt hashes, source commit, release ID, release signing key and portfolio design fingerprint. A distinct `deployment_approval` Ed25519 trust-store role signs short-lived approvals (24h default, 7-day maximum). The Trading PC re-verifies approval signature, revocation/expiry, exact environment binding and the complete signed release receipt before supervised live starts. The approval private key must remain off the Trading PC. See `docs/phase30-deployment-approval.md`.

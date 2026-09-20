@@ -84,6 +84,48 @@ if ($RuntimeProvenanceEnabled -and -not $SignedReleaseEnabled) {
     throw "FOREX_REQUIRE_RUNTIME_PROVENANCE requires FOREX_REQUIRE_SIGNED_RELEASE=1."
 }
 
+# Phase 30 requires an explicit, environment-bound deployment approval after the
+# release ceremony. It defaults on whenever signed-release verification is on.
+$RequireDeploymentApprovalRaw = [string]$env:FOREX_REQUIRE_DEPLOYMENT_APPROVAL
+if ([string]::IsNullOrWhiteSpace($RequireDeploymentApprovalRaw)) {
+    $DeploymentApprovalEnabled = $SignedReleaseEnabled
+} else {
+    $DeploymentApprovalEnabled = @("1", "true", "yes", "on") -contains $RequireDeploymentApprovalRaw.ToLowerInvariant()
+}
+if ($DeploymentApprovalEnabled -and -not $SignedReleaseEnabled) {
+    throw "FOREX_REQUIRE_DEPLOYMENT_APPROVAL requires FOREX_REQUIRE_SIGNED_RELEASE=1."
+}
+
+$DeploymentEnvironmentId = [string]$env:FOREX_DEPLOYMENT_ENVIRONMENT_ID
+if ($DeploymentApprovalEnabled -and [string]::IsNullOrWhiteSpace($DeploymentEnvironmentId)) {
+    throw "FOREX_DEPLOYMENT_ENVIRONMENT_ID is required when the deployment approval gate is enabled."
+}
+
+$DeploymentApprovalPath = [string]$env:FOREX_DEPLOYMENT_APPROVAL_PATH
+if ([string]::IsNullOrWhiteSpace($DeploymentApprovalPath)) {
+    $DeploymentApprovalPath = "release/deployment_approval.json"
+}
+
+$DeploymentApprovalSignature = [string]$env:FOREX_DEPLOYMENT_APPROVAL_SIGNATURE
+if ([string]::IsNullOrWhiteSpace($DeploymentApprovalSignature)) {
+    $DeploymentApprovalSignature = "release/deployment_approval.signature.json"
+}
+
+$SigningKeyTrustStore = [string]$env:FOREX_SIGNING_KEY_TRUST_STORE
+if ([string]::IsNullOrWhiteSpace($SigningKeyTrustStore)) {
+    $SigningKeyTrustStore = "release/signing_key_trust.json"
+}
+
+$ReleaseReceipt = [string]$env:FOREX_RELEASE_RECEIPT
+if ([string]::IsNullOrWhiteSpace($ReleaseReceipt)) {
+    $ReleaseReceipt = "release/release_receipt.json"
+}
+
+$ReleaseReceiptSignature = [string]$env:FOREX_RELEASE_RECEIPT_SIGNATURE
+if ([string]::IsNullOrWhiteSpace($ReleaseReceiptSignature)) {
+    $ReleaseReceiptSignature = "release/release_receipt.signature.json"
+}
+
 # Phase 14 broker/local restart reconciliation is fail-closed by default. A
 # temporary migration bypass requires the operator to explicitly set this to 0.
 $RestartReconcileRaw = [string]$env:FOREX_REQUIRE_RESTART_RECONCILE
@@ -191,6 +233,27 @@ function Test-RuntimeProvenance {
     }
 }
 
+function Test-DeploymentApproval {
+    if (-not $DeploymentApprovalEnabled) {
+        Write-Warning "Phase 30 deployment approval gate is explicitly disabled by FOREX_REQUIRE_DEPLOYMENT_APPROVAL."
+        return
+    }
+
+    & $Python -m src.deployment_approval `
+        --mode verify `
+        --root $ProjectRoot `
+        --environment-id $DeploymentEnvironmentId `
+        --approval $DeploymentApprovalPath `
+        --signature $DeploymentApprovalSignature `
+        --receipt $ReleaseReceipt `
+        --receipt-signature $ReleaseReceiptSignature `
+        --trust-store $SigningKeyTrustStore
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Deployment approval verification failed. Supervised live will not start."
+    }
+}
+
 function Test-RestartReconciliation {
     if (-not $RestartReconcileEnabled) {
         Write-Warning "Phase 14 restart reconciliation is explicitly disabled by FOREX_REQUIRE_RESTART_RECONCILE."
@@ -224,6 +287,7 @@ while ($Restarts -le $MaxRestarts) {
     Test-SignedRelease
     Test-MarketCalendarProvenance
     Test-RuntimeProvenance
+    Test-DeploymentApproval
     Test-RestartReconciliation
 
     & $Python -m src.production --mode supervised-live --arm-live $ArmPhrase

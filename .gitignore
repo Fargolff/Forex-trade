@@ -40,3 +40,5 @@ release/ci_attestation.signature.json
 Thumbs.db
 .vscode/
 .idea/
+release/deployment_approval.json
+release/deployment_approval.signature.json
