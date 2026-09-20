@@ -56,10 +56,14 @@ jobs:
             echo "created=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          if [ ! -f release/forex-ci-attestation-public.pem ]; then
-            echo "::error::CI attestation secret is configured but release/forex-ci-attestation-public.pem is missing."
+          if [ ! -f release/signing_key_trust.json ]; then
+            echo "::error::CI attestation secret is configured but release/signing_key_trust.json is missing."
             exit 1
           fi
+          python -m src.key_policy \
+            --mode verify-store \
+            --root . \
+            --trust-store release/signing_key_trust.json
           printf '%s' "$CI_PRIVATE_KEY_B64" | base64 --decode > "$RUNNER_TEMP/forex-ci-attestation-private.pem"
           chmod 600 "$RUNNER_TEMP/forex-ci-attestation-private.pem"
           python -m src.ci_attestation \
@@ -77,10 +81,12 @@ jobs:
           python -m src.ci_attestation \
             --mode sign \
             --root . \
-            --private-key "$RUNNER_TEMP/forex-ci-attestation-private.pem"
+            --private-key "$RUNNER_TEMP/forex-ci-attestation-private.pem" \
+            --trust-store release/signing_key_trust.json
           python -m src.ci_attestation \
             --mode verify \
             --root . \
+            --trust-store release/signing_key_trust.json \
             --expected-source-commit "$SOURCE_COMMIT" \
             --expected-repository "$GITHUB_REPOSITORY" \
             --expected-workflow "$GITHUB_WORKFLOW" \
