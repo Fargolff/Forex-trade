@@ -36,6 +36,8 @@ DEPLOYMENT_PATTERNS = (
     "production.example.yaml",
     "watchdog.example.yaml",
     "deploy/windows/*.ps1",
+    "release/signing_key_trust.json",
+    "release/keys/*.pem",
 )
 
 

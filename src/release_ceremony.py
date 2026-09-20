@@ -15,6 +15,7 @@ from typing import Any
 from cryptography.exceptions import InvalidSignature
 
 from .artifact import DEFAULT_BUNDLE, DEFAULT_BUNDLE_SIGNATURE, build_release_bundle, sign_release_bundle, verify_release_bundle
+from .key_policy import DEFAULT_TRUST_STORE, authorize_signing_key, resolve_verification_key
 from .calendar_provenance import DEFAULT_CALENDAR_PATH, DEFAULT_MIN_COVERAGE_DAYS, bind_calendar_to_manifest, freshness_report, verify_calendar_provenance
 from .ci_attestation import DEFAULT_ATTESTATION as DEFAULT_CI_ATTESTATION, DEFAULT_PUBLIC_KEY as DEFAULT_CI_PUBLIC_KEY, DEFAULT_REPOSITORY as DEFAULT_CI_REPOSITORY, DEFAULT_SIGNATURE as DEFAULT_CI_SIGNATURE, DEFAULT_WORKFLOW as DEFAULT_CI_WORKFLOW, verify_ci_attestation
 from .recovery import create_deployment_manifest, sha256_file, verify_deployment_manifest
@@ -128,12 +129,18 @@ def _publish(source: Path, target: Path) -> None:
     temp.replace(target)
 
 
-def sign_receipt(receipt_path: str | Path, private_key_path: str | Path, signature_path: str | Path) -> dict[str, Any]:
+def sign_receipt(
+    receipt_path: str | Path,
+    private_key_path: str | Path,
+    signature_path: str | Path,
+    *,
+    key_id: str | None = None,
+) -> dict[str, Any]:
     payload = Path(receipt_path).read_bytes()
     private = load_private_key(private_key_path)
     signature = private.sign(payload)
     document = {
-        "version": 1,
+        "version": 2 if key_id else 1,
         "algorithm": "Ed25519",
         "document": RECEIPT_FORMAT,
         "receipt_sha256": hashlib.sha256(payload).hexdigest(),
@@ -141,6 +148,8 @@ def sign_receipt(receipt_path: str | Path, private_key_path: str | Path, signatu
         "signed_at": _now(),
         "signature_b64": base64.b64encode(signature).decode("ascii"),
     }
+    if key_id:
+        document["key_id"] = str(key_id)
     Path(signature_path).write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return document
 
@@ -149,8 +158,11 @@ def verify_receipt_signature(receipt_path: str | Path, signature_path: str | Pat
     try:
         payload = Path(receipt_path).read_bytes()
         document = json.loads(Path(signature_path).read_text(encoding="utf-8"))
-        if not isinstance(document, dict) or document.get("version") != 1 or document.get("algorithm") != "Ed25519" or document.get("document") != RECEIPT_FORMAT:
+        version = document.get("version") if isinstance(document, dict) else None
+        if not isinstance(document, dict) or version not in (1, 2) or document.get("algorithm") != "Ed25519" or document.get("document") != RECEIPT_FORMAT:
             raise ValueError("unsupported release receipt signature format")
+        if version == 2 and not str(document.get("key_id", "")).strip():
+            return {"ok": False, "code": "KEY_ID_MISSING"}
         expected = hashlib.sha256(payload).hexdigest()
         if document.get("receipt_sha256") != expected:
             return {"ok": False, "code": "RECEIPT_HASH_MISMATCH"}
@@ -166,19 +178,22 @@ def verify_receipt_signature(receipt_path: str | Path, signature_path: str | Pat
             public.verify(signature, payload)
         except InvalidSignature:
             return {"ok": False, "code": "SIGNATURE_INVALID"}
-        return {"ok": True, "code": "SIGNATURE_VALID", "receipt_sha256": expected, "public_key_fingerprint": fingerprint, "signed_at": document.get("signed_at")}
+        return {"ok": True, "code": "SIGNATURE_VALID", "receipt_sha256": expected, "public_key_fingerprint": fingerprint, "signed_at": document.get("signed_at"), "key_id": document.get("key_id")}
     except Exception as exc:
         return {"ok": False, "code": f"RECEIPT_SIGNATURE_INVALID:{type(exc).__name__}:{exc}"}
 
 
-def release_preflight(root: str | Path, *, source_commit: str, release_id: str, public_key_path: str | Path = DEFAULT_PUBLIC_KEY, private_key_path: str | Path | None = None, calendar_path: str | Path = DEFAULT_CALENDAR_PATH, require_calendar: bool = False, min_coverage_days: int = DEFAULT_MIN_COVERAGE_DAYS, config_path: str = DEFAULT_CONFIG, production_path: str = DEFAULT_PRODUCTION, production_fallback: str = DEFAULT_PRODUCTION_FALLBACK, reconcile_path: str = DEFAULT_RECONCILE, watchdog_path: str = DEFAULT_WATCHDOG, watchdog_fallback: str = DEFAULT_WATCHDOG_FALLBACK) -> dict[str, Any]:
+def release_preflight(root: str | Path, *, source_commit: str, release_id: str, public_key_path: str | Path = DEFAULT_PUBLIC_KEY, private_key_path: str | Path | None = None, trust_store_path: str | Path = DEFAULT_TRUST_STORE, calendar_path: str | Path = DEFAULT_CALENDAR_PATH, require_calendar: bool = False, min_coverage_days: int = DEFAULT_MIN_COVERAGE_DAYS, config_path: str = DEFAULT_CONFIG, production_path: str = DEFAULT_PRODUCTION, production_fallback: str = DEFAULT_PRODUCTION_FALLBACK, reconcile_path: str = DEFAULT_RECONCILE, watchdog_path: str = DEFAULT_WATCHDOG, watchdog_fallback: str = DEFAULT_WATCHDOG_FALLBACK) -> dict[str, Any]:
     root = Path(root).resolve()
     commit = _commit(source_commit)
     rid = _release_id(release_id)
-    ci_check = verify_ci_attestation(root, DEFAULT_CI_ATTESTATION, DEFAULT_CI_SIGNATURE, DEFAULT_CI_PUBLIC_KEY, expected_source_commit=commit, expected_repository=DEFAULT_CI_REPOSITORY, expected_workflow=DEFAULT_CI_WORKFLOW, require_main_ref=True)
+    ci_check = verify_ci_attestation(root, DEFAULT_CI_ATTESTATION, DEFAULT_CI_SIGNATURE, DEFAULT_CI_PUBLIC_KEY, trust_store_path, expected_source_commit=commit, expected_repository=DEFAULT_CI_REPOSITORY, expected_workflow=DEFAULT_CI_WORKFLOW, require_main_ref=True)
     if not ci_check["ok"]:
         raise RuntimeError(f"CI attestation preflight failed: {ci_check['issues']}")
-    _, fingerprint = _fingerprint_pair(root, private_key_path, public_key_path)
+    public, fingerprint = _fingerprint_pair(root, private_key_path, public_key_path)
+    release_policy = authorize_signing_key(root, trust_store_path, role="release", fingerprint=fingerprint)
+    if Path(release_policy["public_key_path"]).resolve() != public.resolve():
+        raise ValueError("release public key path does not match the trust-store key identity")
     runtime_kwargs = _runtime_kwargs(config_path, production_path, production_fallback, reconcile_path, watchdog_path, watchdog_fallback)
     runtime_binding = build_runtime_binding(root, **runtime_kwargs)
     calendar = _calendar(root, calendar_path)
@@ -210,6 +225,7 @@ def release_preflight(root: str | Path, *, source_commit: str, release_id: str, 
         "source_commit": commit,
         "release_id": rid,
         "public_key_fingerprint": fingerprint,
+        "release_key_id": release_policy["key_id"],
         "ci_attestation": ci_check,
         "deployment_entries": len(created["entries"]),
         "runtime": runtime_binding["portfolio"],
@@ -217,7 +233,7 @@ def release_preflight(root: str | Path, *, source_commit: str, release_id: str, 
     }
 
 
-def run_release_ceremony(root: str | Path, *, source_commit: str, release_id: str, private_key_path: str | Path, public_key_path: str | Path = DEFAULT_PUBLIC_KEY, manifest_path: str = DEFAULT_MANIFEST, release_signature_path: str = DEFAULT_SIGNATURE, archive_path: str = DEFAULT_BUNDLE, bundle_signature_path: str = DEFAULT_BUNDLE_SIGNATURE, receipt_path: str = DEFAULT_RECEIPT, receipt_signature_path: str = DEFAULT_RECEIPT_SIGNATURE, calendar_path: str | Path = DEFAULT_CALENDAR_PATH, require_calendar: bool = False, min_coverage_days: int = DEFAULT_MIN_COVERAGE_DAYS, config_path: str = DEFAULT_CONFIG, production_path: str = DEFAULT_PRODUCTION, production_fallback: str = DEFAULT_PRODUCTION_FALLBACK, reconcile_path: str = DEFAULT_RECONCILE, watchdog_path: str = DEFAULT_WATCHDOG, watchdog_fallback: str = DEFAULT_WATCHDOG_FALLBACK, overwrite: bool = False) -> dict[str, Any]:
+def run_release_ceremony(root: str | Path, *, source_commit: str, release_id: str, private_key_path: str | Path, public_key_path: str | Path = DEFAULT_PUBLIC_KEY, trust_store_path: str | Path = DEFAULT_TRUST_STORE, manifest_path: str = DEFAULT_MANIFEST, release_signature_path: str = DEFAULT_SIGNATURE, archive_path: str = DEFAULT_BUNDLE, bundle_signature_path: str = DEFAULT_BUNDLE_SIGNATURE, receipt_path: str = DEFAULT_RECEIPT, receipt_signature_path: str = DEFAULT_RECEIPT_SIGNATURE, calendar_path: str | Path = DEFAULT_CALENDAR_PATH, require_calendar: bool = False, min_coverage_days: int = DEFAULT_MIN_COVERAGE_DAYS, config_path: str = DEFAULT_CONFIG, production_path: str = DEFAULT_PRODUCTION, production_fallback: str = DEFAULT_PRODUCTION_FALLBACK, reconcile_path: str = DEFAULT_RECONCILE, watchdog_path: str = DEFAULT_WATCHDOG, watchdog_fallback: str = DEFAULT_WATCHDOG_FALLBACK, overwrite: bool = False) -> dict[str, Any]:
     root = Path(root).resolve()
     commit = _commit(source_commit)
     rid = _release_id(release_id)
@@ -227,8 +243,9 @@ def run_release_ceremony(root: str | Path, *, source_commit: str, release_id: st
         raise FileExistsError(f"refusing to overwrite existing release artifacts: {', '.join(existing)}")
     private = _private_key(root, private_key_path)
     public, fingerprint = _fingerprint_pair(root, private, public_key_path)
-    preflight = release_preflight(root, source_commit=commit, release_id=rid, public_key_path=public_key_path, private_key_path=private, calendar_path=calendar_path, require_calendar=require_calendar, min_coverage_days=min_coverage_days, config_path=config_path, production_path=production_path, production_fallback=production_fallback, reconcile_path=reconcile_path, watchdog_path=watchdog_path, watchdog_fallback=watchdog_fallback)
+    preflight = release_preflight(root, source_commit=commit, release_id=rid, public_key_path=public_key_path, private_key_path=private, trust_store_path=trust_store_path, calendar_path=calendar_path, require_calendar=require_calendar, min_coverage_days=min_coverage_days, config_path=config_path, production_path=production_path, production_fallback=production_fallback, reconcile_path=reconcile_path, watchdog_path=watchdog_path, watchdog_fallback=watchdog_fallback)
     ci_check = preflight["ci_attestation"]
+    release_key_id = preflight["release_key_id"]
     runtime_kwargs = _runtime_kwargs(config_path, production_path, production_fallback, reconcile_path, watchdog_path, watchdog_fallback)
     calendar = _calendar(root, calendar_path)
 
@@ -252,12 +269,12 @@ def run_release_ceremony(root: str | Path, *, source_commit: str, release_id: st
         if not deployment["ok"] or not calendar_check["ok"] or not runtime_check["ok"]:
             raise RuntimeError("release ceremony provenance verification failed before signing")
 
-        release_sig = sign_manifest(staged["manifest"], private, staged["release_signature"])
+        release_sig = sign_manifest(staged["manifest"], private, staged["release_signature"], key_id=release_key_id)
         release_check = verify_release(root, staged["manifest"], staged["release_signature"], public)
         if not release_check["ok"]:
             raise RuntimeError(f"signed release verification failed: {release_check}")
         bundle = build_release_bundle(root, staged["manifest"], staged["release_signature"], public, staged["bundle"], source_commit=commit, release_id=rid)
-        bundle_sig = sign_release_bundle(staged["bundle"], private, staged["bundle_signature"])
+        bundle_sig = sign_release_bundle(staged["bundle"], private, staged["bundle_signature"], key_id=release_key_id)
         bundle_check = verify_release_bundle(staged["bundle"], staged["bundle_signature"], public, expected_source_commit=commit, expected_release_id=rid, deployed_manifest_path=staged["manifest"], deployed_release_signature_path=staged["release_signature"])
         if not bundle_check["ok"]:
             raise RuntimeError(f"signed bundle verification failed: {bundle_check['issues']}")
@@ -269,12 +286,14 @@ def run_release_ceremony(root: str | Path, *, source_commit: str, release_id: st
             "release_id": rid,
             "completed_at": _now(),
             "public_key_fingerprint": fingerprint,
+            "release_key_id": release_key_id,
             "deployment_entries": len(manifest["entries"]),
             "artifacts": {name: _descriptor(staged[name], outputs[name], root) for name in ("manifest", "release_signature", "bundle", "bundle_signature")},
             "ci_attestation": {
                 "attestation": _descriptor(_under(root, DEFAULT_CI_ATTESTATION), _under(root, DEFAULT_CI_ATTESTATION), root),
                 "signature": _descriptor(_under(root, DEFAULT_CI_SIGNATURE), _under(root, DEFAULT_CI_SIGNATURE), root),
                 "public_key_fingerprint": ci_check.get("public_key_fingerprint"),
+                "key_id": ci_check.get("key_id"),
                 "repository": ci_check.get("repository"),
                 "workflow": ci_check.get("workflow"),
                 "run_id": ci_check.get("run_id"),
@@ -302,24 +321,37 @@ def run_release_ceremony(root: str | Path, *, source_commit: str, release_id: st
             "signing": {"release_signed_at": release_sig.get("signed_at"), "bundle_signed_at": bundle_sig.get("signed_at")},
         }
         staged["receipt"].write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        sign_receipt(staged["receipt"], private, staged["receipt_signature"])
+        sign_receipt(staged["receipt"], private, staged["receipt_signature"], key_id=release_key_id)
         receipt_check = verify_receipt_signature(staged["receipt"], staged["receipt_signature"], public)
         if not receipt_check["ok"]:
             raise RuntimeError(f"release receipt signature verification failed: {receipt_check}")
         for name in ("manifest", "release_signature", "bundle", "bundle_signature", "receipt", "receipt_signature"):
             _publish(staged[name], outputs[name])
 
-    final = verify_release_receipt(root, receipt_path=receipt_path, receipt_signature_path=receipt_signature_path, public_key_path=public_key_path, calendar_path=calendar_path, expected_source_commit=commit, expected_release_id=rid, config_path=config_path, production_path=production_path, production_fallback=production_fallback, reconcile_path=reconcile_path, watchdog_path=watchdog_path, watchdog_fallback=watchdog_fallback)
+    final = verify_release_receipt(root, receipt_path=receipt_path, receipt_signature_path=receipt_signature_path, public_key_path=public_key_path, trust_store_path=trust_store_path, calendar_path=calendar_path, expected_source_commit=commit, expected_release_id=rid, config_path=config_path, production_path=production_path, production_fallback=production_fallback, reconcile_path=reconcile_path, watchdog_path=watchdog_path, watchdog_fallback=watchdog_fallback)
     if not final["ok"]:
         raise RuntimeError(f"published release receipt verification failed: {final['issues']}")
     return {"ok": True, "code": "RELEASE_CEREMONY_COMPLETE", "source_commit": commit, "release_id": rid, "receipt": _safe(receipt_path), "receipt_signature": _safe(receipt_signature_path), "public_key_fingerprint": preflight["public_key_fingerprint"], "final_verification": final}
 
 
-def verify_release_receipt(root: str | Path, *, receipt_path: str | Path = DEFAULT_RECEIPT, receipt_signature_path: str | Path = DEFAULT_RECEIPT_SIGNATURE, public_key_path: str | Path = DEFAULT_PUBLIC_KEY, calendar_path: str | Path = DEFAULT_CALENDAR_PATH, expected_source_commit: str | None = None, expected_release_id: str | None = None, config_path: str = DEFAULT_CONFIG, production_path: str = DEFAULT_PRODUCTION, production_fallback: str = DEFAULT_PRODUCTION_FALLBACK, reconcile_path: str = DEFAULT_RECONCILE, watchdog_path: str = DEFAULT_WATCHDOG, watchdog_fallback: str = DEFAULT_WATCHDOG_FALLBACK) -> dict[str, Any]:
+def verify_release_receipt(root: str | Path, *, receipt_path: str | Path = DEFAULT_RECEIPT, receipt_signature_path: str | Path = DEFAULT_RECEIPT_SIGNATURE, public_key_path: str | Path = DEFAULT_PUBLIC_KEY, trust_store_path: str | Path = DEFAULT_TRUST_STORE, calendar_path: str | Path = DEFAULT_CALENDAR_PATH, expected_source_commit: str | None = None, expected_release_id: str | None = None, config_path: str = DEFAULT_CONFIG, production_path: str = DEFAULT_PRODUCTION, production_fallback: str = DEFAULT_PRODUCTION_FALLBACK, reconcile_path: str = DEFAULT_RECONCILE, watchdog_path: str = DEFAULT_WATCHDOG, watchdog_fallback: str = DEFAULT_WATCHDOG_FALLBACK) -> dict[str, Any]:
     root = Path(root).resolve()
     receipt = _under(root, receipt_path)
     signature = _under(root, receipt_signature_path)
     public = _under(root, public_key_path)
+    try:
+        signature_doc = json.loads(signature.read_text(encoding="utf-8"))
+        release_policy = resolve_verification_key(
+            root,
+            trust_store_path,
+            role="release",
+            key_id=str(signature_doc.get("key_id", "")),
+            fingerprint=str(signature_doc.get("public_key_fingerprint", "")),
+            signed_at=str(signature_doc.get("signed_at", "")),
+        )
+        public = Path(release_policy["public_key_path"])
+    except Exception as exc:
+        return {"ok": False, "code": "RELEASE_RECEIPT_INVALID", "issues": [f"receipt_key_policy:{type(exc).__name__}:{exc}"]}
     sig = verify_receipt_signature(receipt, signature, public)
     if not sig["ok"]:
         return {"ok": False, "code": "RELEASE_RECEIPT_INVALID", "issues": [f"receipt_signature:{sig['code']}"], "signature": sig}
@@ -336,6 +368,8 @@ def verify_release_receipt(root: str | Path, *, receipt_path: str | Path = DEFAU
     fingerprint = public_key_fingerprint(load_public_key(public))
     if document.get("public_key_fingerprint") != fingerprint:
         issues.append("receipt:public_key_fingerprint")
+    if document.get("release_key_id") != sig.get("key_id"):
+        issues.append("receipt:release_key_id")
 
     ci_check = None
     ci_doc = document.get("ci_attestation") if isinstance(document.get("ci_attestation"), dict) else {}
@@ -358,10 +392,10 @@ def verify_release_receipt(root: str | Path, *, receipt_path: str | Path = DEFAU
         except Exception as exc:
             issues.append(f"ci_attestation:{role}:{type(exc).__name__}:{exc}")
     if {"attestation", "signature"} <= set(ci_paths):
-        ci_check = verify_ci_attestation(root, ci_paths["attestation"], ci_paths["signature"], DEFAULT_CI_PUBLIC_KEY, expected_source_commit=commit, expected_repository=DEFAULT_CI_REPOSITORY, expected_workflow=DEFAULT_CI_WORKFLOW, require_main_ref=True)
+        ci_check = verify_ci_attestation(root, ci_paths["attestation"], ci_paths["signature"], DEFAULT_CI_PUBLIC_KEY, trust_store_path, expected_source_commit=commit, expected_repository=DEFAULT_CI_REPOSITORY, expected_workflow=DEFAULT_CI_WORKFLOW, require_main_ref=True)
         if not ci_check["ok"]:
             issues.extend(f"ci_attestation:{issue}" for issue in ci_check["issues"])
-        for field in ("public_key_fingerprint", "repository", "workflow", "run_id", "run_attempt", "run_url", "source_tree_sha256"):
+        for field in ("public_key_fingerprint", "key_id", "repository", "workflow", "run_id", "run_attempt", "run_url", "source_tree_sha256"):
             if ci_doc.get(field) != ci_check.get(field):
                 issues.append(f"ci_attestation:{field}")
 
@@ -409,17 +443,18 @@ def verify_release_receipt(root: str | Path, *, receipt_path: str | Path = DEFAU
         if not bundle_check["ok"]:
             issues.extend(f"bundle:{issue}" for issue in bundle_check["issues"])
 
-    return {"ok": not issues, "code": "RELEASE_RECEIPT_VALID" if not issues else "RELEASE_RECEIPT_INVALID", "issues": issues, "source_commit": commit, "release_id": rid, "public_key_fingerprint": fingerprint, "signature": sig, "ci_attestation": ci_check, "release": release_check, "runtime": runtime_check, "calendar": calendar_check, "bundle": bundle_check}
+    return {"ok": not issues, "code": "RELEASE_RECEIPT_VALID" if not issues else "RELEASE_RECEIPT_INVALID", "issues": issues, "source_commit": commit, "release_id": rid, "public_key_fingerprint": fingerprint, "release_key_id": sig.get("key_id"), "signature": sig, "ci_attestation": ci_check, "release": release_check, "runtime": runtime_check, "calendar": calendar_check, "bundle": bundle_check}
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Phase 28 CI-attested deterministic release ceremony and signed receipt")
+    parser = argparse.ArgumentParser(description="Phase 29 key-policy-gated CI-attested release ceremony")
     parser.add_argument("--mode", choices=["preflight", "run", "verify-receipt"], required=True)
     parser.add_argument("--root", default=".")
     parser.add_argument("--source-commit")
     parser.add_argument("--release-id")
     parser.add_argument("--private-key")
     parser.add_argument("--public-key", default=DEFAULT_PUBLIC_KEY)
+    parser.add_argument("--trust-store", default=DEFAULT_TRUST_STORE)
     parser.add_argument("--manifest", default=DEFAULT_MANIFEST)
     parser.add_argument("--release-signature", default=DEFAULT_SIGNATURE)
     parser.add_argument("--archive", default=DEFAULT_BUNDLE)
@@ -446,19 +481,19 @@ def main() -> None:
         "watchdog_fallback": args.watchdog_fallback,
     }
     if args.mode == "verify-receipt":
-        result = verify_release_receipt(args.root, receipt_path=args.receipt, receipt_signature_path=args.receipt_signature, public_key_path=args.public_key, calendar_path=args.calendar, expected_source_commit=args.source_commit, expected_release_id=args.release_id, **runtime)
+        result = verify_release_receipt(args.root, receipt_path=args.receipt, receipt_signature_path=args.receipt_signature, public_key_path=args.public_key, trust_store_path=args.trust_store, calendar_path=args.calendar, expected_source_commit=args.source_commit, expected_release_id=args.release_id, **runtime)
         print(json.dumps(result, indent=2, sort_keys=True, default=str))
         raise SystemExit(0 if result["ok"] else 3)
     if not args.source_commit or not args.release_id:
         raise ValueError("preflight/run require --source-commit and --release-id")
     private = args.private_key or os.getenv(PRIVATE_KEY_ENV, "").strip() or None
     if args.mode == "preflight":
-        result = release_preflight(args.root, source_commit=args.source_commit, release_id=args.release_id, public_key_path=args.public_key, private_key_path=private, calendar_path=args.calendar, require_calendar=args.require_calendar, min_coverage_days=args.min_calendar_coverage_days, **runtime)
+        result = release_preflight(args.root, source_commit=args.source_commit, release_id=args.release_id, public_key_path=args.public_key, private_key_path=private, trust_store_path=args.trust_store, calendar_path=args.calendar, require_calendar=args.require_calendar, min_coverage_days=args.min_calendar_coverage_days, **runtime)
         print(json.dumps(result, indent=2, sort_keys=True, default=str))
         return
     if not private:
         raise ValueError(f"run requires --private-key or {PRIVATE_KEY_ENV}")
-    result = run_release_ceremony(args.root, source_commit=args.source_commit, release_id=args.release_id, private_key_path=private, public_key_path=args.public_key, manifest_path=args.manifest, release_signature_path=args.release_signature, archive_path=args.archive, bundle_signature_path=args.bundle_signature, receipt_path=args.receipt, receipt_signature_path=args.receipt_signature, calendar_path=args.calendar, require_calendar=args.require_calendar, min_coverage_days=args.min_calendar_coverage_days, overwrite=args.overwrite, **runtime)
+    result = run_release_ceremony(args.root, source_commit=args.source_commit, release_id=args.release_id, private_key_path=private, public_key_path=args.public_key, trust_store_path=args.trust_store, manifest_path=args.manifest, release_signature_path=args.release_signature, archive_path=args.archive, bundle_signature_path=args.bundle_signature, receipt_path=args.receipt, receipt_signature_path=args.receipt_signature, calendar_path=args.calendar, require_calendar=args.require_calendar, min_coverage_days=args.min_calendar_coverage_days, overwrite=args.overwrite, **runtime)
     print(json.dumps(result, indent=2, sort_keys=True, default=str))
 
 

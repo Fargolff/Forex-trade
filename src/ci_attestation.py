@@ -12,6 +12,7 @@ from typing import Any
 
 from cryptography.exceptions import InvalidSignature
 
+from .key_policy import DEFAULT_TRUST_STORE, authorize_signing_key, resolve_verification_key
 from .recovery import DEPLOYMENT_PATTERNS, sha256_file
 from .release import generate_keypair, load_private_key, load_public_key, public_key_fingerprint
 
@@ -147,6 +148,9 @@ def sign_ci_attestation(
     attestation_path: str | Path = DEFAULT_ATTESTATION,
     private_key_path: str | Path | None = None,
     signature_path: str | Path = DEFAULT_SIGNATURE,
+    *,
+    trust_store_path: str | Path | None = None,
+    key_id: str | None = None,
 ) -> dict[str, Any]:
     root = Path(root).resolve()
     key_value = private_key_path or os.getenv(PRIVATE_KEY_ENV, "").strip()
@@ -156,18 +160,27 @@ def sign_ci_attestation(
     attestation = _path(root, attestation_path)
     payload = attestation.read_bytes()
     private = load_private_key(private_path)
+    fingerprint = public_key_fingerprint(private.public_key())
+    policy = None
+    if trust_store_path is not None:
+        policy = authorize_signing_key(root, trust_store_path, role="ci_attestation", fingerprint=fingerprint)
+        if key_id is not None and str(key_id) != policy["key_id"]:
+            raise ValueError("explicit CI key_id does not match the trust-store identity")
+        key_id = policy["key_id"]
     signature = private.sign(payload)
     document = {
-        "version": 1,
+        "version": 2 if key_id else 1,
         "algorithm": "Ed25519",
         "document": ATTESTATION_FORMAT,
         "attestation_sha256": hashlib.sha256(payload).hexdigest(),
-        "public_key_fingerprint": public_key_fingerprint(private.public_key()),
+        "public_key_fingerprint": fingerprint,
         "signed_at": _now(),
         "signature_b64": base64.b64encode(signature).decode("ascii"),
     }
+    if key_id:
+        document["key_id"] = str(key_id)
     _atomic_json(_path(root, signature_path), document)
-    return document
+    return {**document, "key_policy": policy}
 
 
 def verify_ci_signature(
@@ -175,22 +188,43 @@ def verify_ci_signature(
     attestation_path: str | Path = DEFAULT_ATTESTATION,
     signature_path: str | Path = DEFAULT_SIGNATURE,
     public_key_path: str | Path = DEFAULT_PUBLIC_KEY,
+    *,
+    trust_store_path: str | Path | None = None,
 ) -> dict[str, Any]:
     try:
         root = Path(root).resolve()
         attestation = _path(root, attestation_path)
         signature_file = _path(root, signature_path)
-        public_file = _path(root, public_key_path)
         payload = attestation.read_bytes()
         document = json.loads(signature_file.read_text(encoding="utf-8"))
-        if not isinstance(document, dict) or document.get("version") != 1 or document.get("algorithm") != "Ed25519" or document.get("document") != ATTESTATION_FORMAT:
+        version = document.get("version") if isinstance(document, dict) else None
+        if not isinstance(document, dict) or version not in (1, 2) or document.get("algorithm") != "Ed25519" or document.get("document") != ATTESTATION_FORMAT:
             raise ValueError("unsupported CI attestation signature format")
         expected_hash = hashlib.sha256(payload).hexdigest()
         if document.get("attestation_sha256") != expected_hash:
             return {"ok": False, "code": "CI_ATTESTATION_HASH_MISMATCH"}
+        claimed_fingerprint = str(document.get("public_key_fingerprint", "")).strip().lower()
+        policy = None
+        if trust_store_path is not None:
+            if version != 2 or not str(document.get("key_id", "")).strip():
+                return {"ok": False, "code": "CI_KEY_ID_REQUIRED"}
+            try:
+                policy = resolve_verification_key(
+                    root,
+                    trust_store_path,
+                    role="ci_attestation",
+                    key_id=str(document.get("key_id")),
+                    fingerprint=claimed_fingerprint,
+                    signed_at=str(document.get("signed_at", "")),
+                )
+            except Exception as exc:
+                return {"ok": False, "code": f"CI_KEY_POLICY_REJECTED:{type(exc).__name__}:{exc}"}
+            public_file = Path(policy["public_key_path"])
+        else:
+            public_file = _path(root, public_key_path)
         public = load_public_key(public_file)
         fingerprint = public_key_fingerprint(public)
-        if document.get("public_key_fingerprint") != fingerprint:
+        if claimed_fingerprint != fingerprint:
             return {"ok": False, "code": "CI_PUBLIC_KEY_FINGERPRINT_MISMATCH"}
         try:
             signature = base64.b64decode(str(document.get("signature_b64", "")), validate=True)
@@ -206,6 +240,8 @@ def verify_ci_signature(
             "attestation_sha256": expected_hash,
             "public_key_fingerprint": fingerprint,
             "signed_at": document.get("signed_at"),
+            "key_id": document.get("key_id"),
+            "key_policy": policy,
         }
     except Exception as exc:
         return {"ok": False, "code": f"CI_SIGNATURE_ERROR:{type(exc).__name__}:{exc}"}
@@ -216,6 +252,7 @@ def verify_ci_attestation(
     attestation_path: str | Path = DEFAULT_ATTESTATION,
     signature_path: str | Path = DEFAULT_SIGNATURE,
     public_key_path: str | Path = DEFAULT_PUBLIC_KEY,
+    trust_store_path: str | Path | None = None,
     *,
     expected_source_commit: str | None = None,
     expected_repository: str = DEFAULT_REPOSITORY,
@@ -224,7 +261,7 @@ def verify_ci_attestation(
     require_main_ref: bool = True,
 ) -> dict[str, Any]:
     root = Path(root).resolve()
-    signature = verify_ci_signature(root, attestation_path, signature_path, public_key_path)
+    signature = verify_ci_signature(root, attestation_path, signature_path, public_key_path, trust_store_path=trust_store_path)
     if not signature["ok"]:
         return {"ok": False, "code": "CI_ATTESTATION_INVALID", "issues": [f"signature:{signature['code']}"], "signature": signature}
     try:
@@ -305,6 +342,7 @@ def verify_ci_attestation(
         "ref": workflow.get("ref"),
         "source_tree_sha256": actual_tree["sha256"],
         "public_key_fingerprint": signature.get("public_key_fingerprint"),
+        "key_id": signature.get("key_id"),
         "signature": signature,
     }
 
@@ -316,6 +354,7 @@ def main() -> None:
     parser.add_argument("--attestation", default=DEFAULT_ATTESTATION)
     parser.add_argument("--signature", default=DEFAULT_SIGNATURE)
     parser.add_argument("--public-key", default=DEFAULT_PUBLIC_KEY)
+    parser.add_argument("--trust-store", default=None)
     parser.add_argument("--private-key")
     parser.add_argument("--source-commit")
     parser.add_argument("--expected-source-commit")
@@ -363,7 +402,7 @@ def main() -> None:
         print(json.dumps(result, indent=2, sort_keys=True))
         return
     if args.mode == "sign":
-        result = sign_ci_attestation(root, args.attestation, args.private_key, args.signature)
+        result = sign_ci_attestation(root, args.attestation, args.private_key, args.signature, trust_store_path=args.trust_store)
         print(json.dumps(result, indent=2, sort_keys=True))
         return
     result = verify_ci_attestation(
@@ -371,6 +410,7 @@ def main() -> None:
         args.attestation,
         args.signature,
         args.public_key,
+        args.trust_store,
         expected_source_commit=args.expected_source_commit,
         expected_repository=args.expected_repository,
         expected_workflow=args.expected_workflow,

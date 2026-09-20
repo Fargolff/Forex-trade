@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from src.ci_attestation import DEFAULT_ATTESTATION as DEFAULT_CI_ATTESTATION, DEFAULT_SIGNATURE as DEFAULT_CI_SIGNATURE, create_ci_attestation, sign_ci_attestation
+from src.key_policy import DEFAULT_TRUST_STORE, make_key_record, write_trust_store
 from src.release import generate_keypair
 from src.release_ceremony import release_preflight, run_release_ceremony, verify_release_receipt
 from src.runtime_provenance import compute_design_fingerprint
@@ -32,7 +33,7 @@ def _attest(root: Path, commit: str) -> None:
         ref="refs/heads/main",
         soak_cycles=300,
     )
-    sign_ci_attestation(root, DEFAULT_CI_ATTESTATION, root.parent / "ci-keys" / "ci-private.pem", DEFAULT_CI_SIGNATURE)
+    sign_ci_attestation(root, DEFAULT_CI_ATTESTATION, root.parent / "ci-keys" / "ci-private.pem", DEFAULT_CI_SIGNATURE, trust_store_path=DEFAULT_TRUST_STORE)
 
 
 def _fixture(tmp_path: Path) -> tuple[Path, Path, str]:
@@ -128,6 +129,13 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, str]:
     ci_private = ci_keys / "ci-private.pem"
     ci_public = root / "release" / "forex-ci-attestation-public.pem"
     generate_keypair(ci_private, ci_public)
+    write_trust_store(
+        root,
+        [
+            make_key_record(root, key_id="release-test-2026", role="release", public_key_path=public, valid_from="2020-01-01T00:00:00Z", valid_until="2099-01-01T00:00:00Z"),
+            make_key_record(root, key_id="ci-test-2026", role="ci_attestation", public_key_path=ci_public, valid_from="2020-01-01T00:00:00Z", valid_until="2099-01-01T00:00:00Z"),
+        ],
+    )
     _attest(root, "a" * 40)
     return root, private, fingerprint
 
@@ -159,6 +167,9 @@ def test_full_ceremony_publishes_signed_receipt_and_verifies_defaults(tmp_path: 
     assert receipt["runtime"]["design_fingerprint"] == fingerprint
     assert receipt["artifacts"]["manifest"]["path"] == "release/release_manifest.json"
     assert receipt["artifacts"]["bundle"]["path"] == "release/forex-release-bundle.zip"
+    assert receipt["release_key_id"] == "release-test-2026"
+    assert receipt["ci_attestation"]["key_id"] == "ci-test-2026"
+    assert json.loads((root / "release" / "release_signature.json").read_text(encoding="utf-8"))["version"] == 2
 
     verified = verify_release_receipt(
         root,

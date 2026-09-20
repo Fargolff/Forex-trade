@@ -149,19 +149,23 @@ def sign_release_bundle(
     archive_path: str | Path,
     private_key_path: str | Path,
     signature_path: str | Path,
+    *,
+    key_id: str | None = None,
 ) -> dict[str, Any]:
     archive_bytes = Path(archive_path).read_bytes()
     private_key = load_private_key(private_key_path)
     public_key = private_key.public_key()
     signature = private_key.sign(archive_bytes)
     payload = {
-        "version": 1,
+        "version": 2 if key_id else 1,
         "algorithm": "Ed25519",
         "bundle_sha256": sha256_bytes(archive_bytes),
         "public_key_fingerprint": public_key_fingerprint(public_key),
         "signed_at": datetime.now(timezone.utc).isoformat(),
         "signature_b64": base64.b64encode(signature).decode("ascii"),
     }
+    if key_id:
+        payload["key_id"] = str(key_id)
     target = Path(signature_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -178,8 +182,11 @@ def verify_bundle_signature(
     document = json.loads(Path(signature_path).read_text(encoding="utf-8"))
     if not isinstance(document, dict):
         raise ValueError("bundle signature document must be a JSON object")
-    if document.get("version") != 1 or document.get("algorithm") != "Ed25519":
+    version = document.get("version")
+    if version not in (1, 2) or document.get("algorithm") != "Ed25519":
         raise ValueError("unsupported bundle signature format")
+    if version == 2 and not str(document.get("key_id", "")).strip():
+        return {"ok": False, "code": "KEY_ID_MISSING"}
 
     expected_hash = sha256_bytes(archive_bytes)
     if str(document.get("bundle_sha256", "")) != expected_hash:
@@ -204,6 +211,7 @@ def verify_bundle_signature(
         "bundle_sha256": expected_hash,
         "public_key_fingerprint": fingerprint,
         "signed_at": document.get("signed_at"),
+        "key_id": document.get("key_id"),
     }
 
 

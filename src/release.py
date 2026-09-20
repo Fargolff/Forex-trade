@@ -96,19 +96,23 @@ def sign_manifest(
     manifest_path: str | Path,
     private_key_path: str | Path,
     signature_path: str | Path,
+    *,
+    key_id: str | None = None,
 ) -> dict[str, Any]:
     manifest_bytes = _read_bytes(manifest_path)
     private_key = load_private_key(private_key_path)
     public_key = private_key.public_key()
     signature = private_key.sign(manifest_bytes)
     payload = {
-        "version": 1,
+        "version": 2 if key_id else 1,
         "algorithm": "Ed25519",
         "manifest_sha256": _sha256(manifest_bytes),
         "public_key_fingerprint": public_key_fingerprint(public_key),
         "signed_at": datetime.now(timezone.utc).isoformat(),
         "signature_b64": base64.b64encode(signature).decode("ascii"),
     }
+    if key_id:
+        payload["key_id"] = str(key_id)
     target = Path(signature_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -125,8 +129,11 @@ def verify_signature(
     signature_doc = json.loads(Path(signature_path).read_text(encoding="utf-8"))
     if not isinstance(signature_doc, dict):
         raise ValueError("release signature document must be a JSON object")
-    if signature_doc.get("version") != 1 or signature_doc.get("algorithm") != "Ed25519":
+    version = signature_doc.get("version")
+    if version not in (1, 2) or signature_doc.get("algorithm") != "Ed25519":
         raise ValueError("unsupported release signature format")
+    if version == 2 and not str(signature_doc.get("key_id", "")).strip():
+        return {"ok": False, "code": "KEY_ID_MISSING"}
 
     expected_hash = _sha256(manifest_bytes)
     if str(signature_doc.get("manifest_sha256", "")) != expected_hash:
@@ -160,6 +167,7 @@ def verify_signature(
         "manifest_sha256": expected_hash,
         "public_key_fingerprint": actual_fingerprint,
         "signed_at": signature_doc.get("signed_at"),
+        "key_id": signature_doc.get("key_id"),
     }
 
 

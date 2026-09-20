@@ -606,3 +606,8 @@ Phase 20 persists conservative broker timing evidence in `runtime/session_calibr
 ## Phase 28 — CI Attestation & Source-Commit Provenance
 
 Production release signing now requires a separately signed CI attestation for the exact main-branch source commit and canonical deployment source tree. The CI attestation key is separate from the offline release key; pull-request jobs never receive the CI signing secret. See `docs/phase28-ci-attestation.md`.
+
+## Phase 29 — Signing-Key Rotation, Expiry & Revocation
+
+Production signing now supports a versioned trust store (`release/signing_key_trust.json`) with stable `key_id` values, validity windows, overlapping rotations, and hard revocation. New release/CI signature documents use version 2 and embed the selected `key_id`; expired keys cannot create new signatures, signatures made before planned expiry remain historically verifiable, while revoked keys fail closed even for historical verification. The trust store and `release/keys/*.pem` are included in deployment/source-tree provenance so post-CI trust changes invalidate the attestation. See `docs/phase29-key-rotation.md` and `signing_key_trust.example.json`.
+
