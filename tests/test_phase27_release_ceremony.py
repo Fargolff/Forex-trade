@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from src.ci_attestation import DEFAULT_ATTESTATION as DEFAULT_CI_ATTESTATION, DEFAULT_SIGNATURE as DEFAULT_CI_SIGNATURE, create_ci_attestation, sign_ci_attestation
 from src.release import generate_keypair
 from src.release_ceremony import release_preflight, run_release_ceremony, verify_release_receipt
 from src.runtime_provenance import compute_design_fingerprint
@@ -19,6 +20,21 @@ def _write_csv(path: Path, fieldnames: list[str], rows: list[dict[str, object]])
         writer.writerows(rows)
 
 
+def _attest(root: Path, commit: str) -> None:
+    create_ci_attestation(
+        root,
+        DEFAULT_CI_ATTESTATION,
+        source_commit=commit,
+        run_id="phase28-test-run",
+        run_attempt=1,
+        run_url="https://github.com/Fargolff/Forex-trade/actions/runs/phase28-test-run",
+        event_name="push",
+        ref="refs/heads/main",
+        soak_cycles=300,
+    )
+    sign_ci_attestation(root, DEFAULT_CI_ATTESTATION, root.parent / "ci-keys" / "ci-private.pem", DEFAULT_CI_SIGNATURE)
+
+
 def _fixture(tmp_path: Path) -> tuple[Path, Path, str]:
     root = tmp_path / "project"
     root.mkdir()
@@ -26,6 +42,8 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, str]:
     (root / "src" / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
     (root / "deploy" / "windows").mkdir(parents=True)
     (root / "deploy" / "windows" / "run.ps1").write_text("Write-Host ok\n", encoding="utf-8")
+    (root / ".github" / "workflows").mkdir(parents=True)
+    (root / ".github" / "workflows" / "tests.yml").write_text("name: Forex Auto Trader Tests\n", encoding="utf-8")
     (root / "requirements.txt").write_text("PyYAML>=6.0\n", encoding="utf-8")
     (root / "config.example.yaml").write_text("mode: backtest\n", encoding="utf-8")
     (root / "production.example.yaml").write_text("{}\n", encoding="utf-8")
@@ -105,10 +123,17 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, str]:
     private = keys / "release-private.pem"
     public = root / "release" / "forex-release-public.pem"
     generate_keypair(private, public)
+    ci_keys = tmp_path / "ci-keys"
+    ci_keys.mkdir()
+    ci_private = ci_keys / "ci-private.pem"
+    ci_public = root / "release" / "forex-ci-attestation-public.pem"
+    generate_keypair(ci_private, ci_public)
+    _attest(root, "a" * 40)
     return root, private, fingerprint
 
 
 def _run(root: Path, private: Path, *, overwrite: bool = False) -> dict:
+    _attest(root, "a" * 40)
     return run_release_ceremony(
         root,
         source_commit="a" * 40,
@@ -146,6 +171,7 @@ def test_full_ceremony_publishes_signed_receipt_and_verifies_defaults(tmp_path: 
 
 def test_preflight_is_read_only_for_release_outputs(tmp_path: Path) -> None:
     root, private, fingerprint = _fixture(tmp_path)
+    _attest(root, "b" * 40)
     result = release_preflight(
         root,
         source_commit="b" * 40,
@@ -236,3 +262,17 @@ def test_stale_required_calendar_fails_before_publish(tmp_path: Path) -> None:
         _run(root, private)
     assert not (root / "release" / "release_manifest.json").exists()
     assert not (root / "release" / "release_receipt.json").exists()
+
+
+def test_missing_ci_attestation_fails_before_release_signing(tmp_path: Path) -> None:
+    root, private, _ = _fixture(tmp_path)
+    (root / DEFAULT_CI_ATTESTATION).unlink()
+    with pytest.raises(RuntimeError, match="CI attestation preflight failed"):
+        run_release_ceremony(
+            root,
+            source_commit="a" * 40,
+            release_id="missing-ci-attestation",
+            private_key_path=private,
+            require_calendar=True,
+        )
+    assert not (root / "release" / "release_manifest.json").exists()

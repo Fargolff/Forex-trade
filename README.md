@@ -601,3 +601,8 @@ See `docs/phase19-market-clock.md` before changing the broker-specific UTC sessi
 ## Phase 20 — Broker session calibration
 
 Phase 20 persists conservative broker timing evidence in `runtime/session_calibration.json`. After enough independent weekly samples, the effective Sunday open may move later and the effective Friday close may move earlier, but calibration can never expand beyond the static Phase 19 envelope. A rolling moving-tick offset watchdog halts new trading on persistent broker/host time disagreement. See `docs/phase20-session-calibration.md`.
+
+
+## Phase 28 — CI Attestation & Source-Commit Provenance
+
+Production release signing now requires a separately signed CI attestation for the exact main-branch source commit and canonical deployment source tree. The CI attestation key is separate from the offline release key; pull-request jobs never receive the CI signing secret. See `docs/phase28-ci-attestation.md`.
