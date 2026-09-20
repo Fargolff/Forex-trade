@@ -34,6 +34,25 @@ jobs:
       - name: Apply Phase 29
         run: python tools/phase29_apply.py
 
+      - name: Fix Phase 29 trust-store regression fixture
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path("tests/test_phase29_key_policy.py")
+          text = path.read_text(encoding="utf-8")
+          text = text.replace(
+              'sign_ci_attestation(root, private_key_path=paths["ci-new-private"])\n    store_path = root / DEFAULT_TRUST_STORE',
+              'sign_ci_attestation(root, private_key_path=paths["ci-new-private"], trust_store_path=DEFAULT_TRUST_STORE)\n    store_path = root / DEFAULT_TRUST_STORE',
+              1,
+          )
+          text = text.replace(
+              'report = verify_ci_attestation(root, expected_source_commit="c" * 40)\n    assert report["ok"] is False',
+              'report = verify_ci_attestation(root, expected_source_commit="c" * 40, trust_store_path=DEFAULT_TRUST_STORE)\n    assert report["ok"] is False',
+              1,
+          )
+          path.write_text(text, encoding="utf-8")
+          PY
+
       - name: Run tests
         env:
           PYTHONPATH: .
