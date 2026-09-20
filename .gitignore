@@ -24,6 +24,10 @@ release/*private*.pem
 *.key
 
 # Generated release artifacts
+release/release_manifest.json
+release/release_signature.json
+release/release_receipt.json
+release/release_receipt.signature.json
 release/*.zip
 release/*bundle*.signature.json
 
