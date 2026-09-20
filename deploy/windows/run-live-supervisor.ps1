@@ -126,6 +126,38 @@ if ([string]::IsNullOrWhiteSpace($ReleaseReceiptSignature)) {
     $ReleaseReceiptSignature = "release/release_receipt.signature.json"
 }
 
+# Phase 31 creates a fresh signed runtime boot receipt immediately before each
+# supervised-live start/restart. It defaults on whenever Phase 30 approval is on.
+$RequireRuntimeBootRaw = [string]$env:FOREX_REQUIRE_RUNTIME_BOOT_ATTESTATION
+if ([string]::IsNullOrWhiteSpace($RequireRuntimeBootRaw)) {
+    $RuntimeBootEnabled = $DeploymentApprovalEnabled
+} else {
+    $RuntimeBootEnabled = @("1", "true", "yes", "on") -contains $RequireRuntimeBootRaw.ToLowerInvariant()
+}
+if ($RuntimeBootEnabled -and -not $DeploymentApprovalEnabled) {
+    throw "FOREX_REQUIRE_RUNTIME_BOOT_ATTESTATION requires the Phase 30 deployment approval gate."
+}
+
+$RuntimeMachineId = [string]$env:FOREX_RUNTIME_MACHINE_ID
+if ($RuntimeBootEnabled -and [string]::IsNullOrWhiteSpace($RuntimeMachineId)) {
+    throw "FOREX_RUNTIME_MACHINE_ID is required when runtime boot attestation is enabled."
+}
+
+$RuntimeBootPrivateKey = [string]$env:FOREX_RUNTIME_BOOT_PRIVATE_KEY
+if ($RuntimeBootEnabled -and [string]::IsNullOrWhiteSpace($RuntimeBootPrivateKey)) {
+    throw "FOREX_RUNTIME_BOOT_PRIVATE_KEY is required when runtime boot attestation is enabled."
+}
+
+$RuntimeBootReceipt = [string]$env:FOREX_RUNTIME_BOOT_RECEIPT
+if ([string]::IsNullOrWhiteSpace($RuntimeBootReceipt)) {
+    $RuntimeBootReceipt = "runtime/runtime_boot_receipt.json"
+}
+
+$RuntimeBootSignature = [string]$env:FOREX_RUNTIME_BOOT_SIGNATURE
+if ([string]::IsNullOrWhiteSpace($RuntimeBootSignature)) {
+    $RuntimeBootSignature = "runtime/runtime_boot_receipt.signature.json"
+}
+
 # Phase 14 broker/local restart reconciliation is fail-closed by default. A
 # temporary migration bypass requires the operator to explicitly set this to 0.
 $RestartReconcileRaw = [string]$env:FOREX_REQUIRE_RESTART_RECONCILE
@@ -254,6 +286,49 @@ function Test-DeploymentApproval {
     }
 }
 
+function Write-RuntimeBootAttestation {
+    if (-not $RuntimeBootEnabled) {
+        Write-Warning "Phase 31 runtime boot attestation is explicitly disabled by FOREX_REQUIRE_RUNTIME_BOOT_ATTESTATION."
+        return
+    }
+
+    & $Python -m src.runtime_boot `
+        --mode create `
+        --root $ProjectRoot `
+        --environment-id $DeploymentEnvironmentId `
+        --machine-id $RuntimeMachineId `
+        --private-key $RuntimeBootPrivateKey `
+        --receipt $RuntimeBootReceipt `
+        --signature $RuntimeBootSignature `
+        --approval $DeploymentApprovalPath `
+        --approval-signature $DeploymentApprovalSignature `
+        --release-receipt $ReleaseReceipt `
+        --release-receipt-signature $ReleaseReceiptSignature `
+        --trust-store $SigningKeyTrustStore
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Runtime boot attestation creation failed. Supervised live will not start."
+    }
+
+    & $Python -m src.runtime_boot `
+        --mode verify `
+        --root $ProjectRoot `
+        --environment-id $DeploymentEnvironmentId `
+        --machine-id $RuntimeMachineId `
+        --receipt $RuntimeBootReceipt `
+        --signature $RuntimeBootSignature `
+        --approval $DeploymentApprovalPath `
+        --approval-signature $DeploymentApprovalSignature `
+        --release-receipt $ReleaseReceipt `
+        --release-receipt-signature $ReleaseReceiptSignature `
+        --trust-store $SigningKeyTrustStore `
+        --max-age-seconds 300
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Runtime boot attestation verification failed. Supervised live will not start."
+    }
+}
+
 function Test-RestartReconciliation {
     if (-not $RestartReconcileEnabled) {
         Write-Warning "Phase 14 restart reconciliation is explicitly disabled by FOREX_REQUIRE_RESTART_RECONCILE."
@@ -289,6 +364,7 @@ while ($Restarts -le $MaxRestarts) {
     Test-RuntimeProvenance
     Test-DeploymentApproval
     Test-RestartReconciliation
+    Write-RuntimeBootAttestation
 
     & $Python -m src.production --mode supervised-live --arm-live $ArmPhrase
     $ExitCode = $LASTEXITCODE

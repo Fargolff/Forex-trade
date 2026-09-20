@@ -616,3 +616,8 @@ Production signing now supports a versioned trust store (`release/signing_key_tr
 ## Phase 30 — Release Promotion & Deployment Approval Gate
 
 Production deployment now has a separate authorization layer after the signed release ceremony. `src.deployment_approval` promotes a release through **BUILT → VERIFIED → APPROVED → DEPLOYABLE** and binds the approval to an exact environment ID, release receipt hashes, source commit, release ID, release signing key and portfolio design fingerprint. A distinct `deployment_approval` Ed25519 trust-store role signs short-lived approvals (24h default, 7-day maximum). The Trading PC re-verifies approval signature, revocation/expiry, exact environment binding and the complete signed release receipt before supervised live starts. The approval private key must remain off the Trading PC. See `docs/phase30-deployment-approval.md`.
+
+## Phase 31 — Runtime Boot Attestation
+
+Production supervisor starts/restarts can now create a fresh Ed25519-signed boot receipt after release, provenance, deployment-approval, and restart-reconciliation gates pass. The receipt binds the exact environment, machine ID, approved release, portfolio design fingerprint, approval/release artifact hashes, runtime boot key identity, and previous boot-receipt hash. Receipts older than five minutes are rejected at startup and each boot is archived under `runtime/boot_attestations/` for audit. Runtime boot keys use the dedicated `runtime_boot` trust role and cannot sign releases or deployment approvals. Live trading remains disabled by default and still requires the exact arm phrase.
+
