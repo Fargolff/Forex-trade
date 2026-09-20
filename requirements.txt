@@ -2,4 +2,5 @@ pandas>=2.2
 numpy>=2.0
 PyYAML>=6.0
 MetaTrader5>=5.0.45
+cryptography>=43.0
 pytest>=8.0

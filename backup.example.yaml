@@ -1,0 +1,23 @@
+# Phase 13 managed backup policy.
+# Copy to backup.yaml for local use. backup.yaml is intentionally gitignored.
+
+local_dir: backups/runtime
+catalog_path: runtime/backup_catalog.json
+drill_report_path: runtime/backup_restore_drill.json
+
+# The actual off-device root is read from this environment variable.
+# Examples: an encrypted external drive, a UNC/network share, or a folder
+# already protected/synchronized by an approved backup product.
+replica_root_env: FOREX_BACKUP_REPLICA_ROOT
+replica_subdir: Forex-trade/runtime-backups
+
+# Grandfather/Father/Son-style local retention buckets.
+# A backup is kept if it belongs to ANY bucket below.
+keep_latest: 7
+keep_daily: 14
+keep_weekly: 8
+keep_monthly: 12
+
+# Fail-safe default: local pruning is allowed only when a byte-identical,
+# verified replica is still reachable at prune time.
+require_verified_replica_before_prune: true

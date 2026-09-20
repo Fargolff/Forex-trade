@@ -1,0 +1,31 @@
+version: 1
+
+# Phase 25 provenance metadata. `valid_through` means the operator has reviewed
+# the broker's holiday/session schedule through this UTC date, including dates
+# with no override. It is NOT merely the date of the last holiday entry below.
+generated_at: "2026-09-20T00:00:00Z"
+valid_through: "2027-01-31"
+
+# Phase 24 broker-calendar restrictions are UTC and restriction-only.
+# They can close the market earlier or open it later than the normal weekly
+# session, but can never expand trading beyond the Phase 19/20 weekly envelope.
+
+days:
+  "2026-12-24":
+    close_utc: "18:00"
+    reason: "Christmas Eve early close"
+
+  "2026-12-25":
+    closed: true
+    reason: "Christmas Day"
+
+  "2026-12-28":
+    open_utc: "23:00"
+    reason: "Delayed broker reopen"
+
+# Temporary closures can represent maintenance, emergency suspensions, or
+# broker-specific halts. Timestamps must include a timezone; UTC is recommended.
+closures:
+  - start_utc: "2026-12-31T20:00:00Z"
+    end_utc: "2027-01-01T23:00:00Z"
+    reason: "New Year broker closure"

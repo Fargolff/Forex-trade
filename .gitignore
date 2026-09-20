@@ -9,6 +9,11 @@ venv/
 config.yaml
 production.yaml
 watchdog.yaml
+backup.yaml
+reconcile.yaml
+remote_watcher.yaml
+watcher_quorum.yaml
+watcher_quorum_trust.yaml
 runtime/
 backups/
 results/
@@ -17,9 +22,26 @@ data/
 # Secrets / local environment
 .env
 .env.*
+release/*private*.pem
+*.release-private.pem
+*.key
+
+# Generated release artifacts
+release/release_manifest.json
+release/release_signature.json
+release/release_receipt.json
+release/release_receipt.signature.json
+release/*.zip
+release/*bundle*.signature.json
+
+release/ci_attestation.json
+
+release/ci_attestation.signature.json
 
 # OS/editor
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
+release/deployment_approval.json
+release/deployment_approval.signature.json

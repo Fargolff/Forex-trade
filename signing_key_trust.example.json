@@ -1,0 +1,46 @@
+{
+  "format": "forex-auto-trader-signing-key-trust-store",
+  "keys": [
+    {
+      "fingerprint": "REPLACE_WITH_SHA256_PUBLIC_KEY_FINGERPRINT",
+      "key_id": "release-2026-q4",
+      "public_key": "release/keys/release-2026-q4.pem",
+      "revoked": false,
+      "revoked_at": null,
+      "role": "release",
+      "valid_from": "2026-10-01T00:00:00+00:00",
+      "valid_until": "2027-10-01T00:00:00+00:00"
+    },
+    {
+      "fingerprint": "REPLACE_WITH_SHA256_PUBLIC_KEY_FINGERPRINT",
+      "key_id": "ci-2026-q4",
+      "public_key": "release/keys/ci-2026-q4.pem",
+      "revoked": false,
+      "revoked_at": null,
+      "role": "ci_attestation",
+      "valid_from": "2026-10-01T00:00:00+00:00",
+      "valid_until": "2027-10-01T00:00:00+00:00"
+    },
+    {
+      "fingerprint": "REPLACE_WITH_SHA256_PUBLIC_KEY_FINGERPRINT",
+      "key_id": "approval-2026-q4",
+      "public_key": "release/keys/approval-2026-q4.pem",
+      "revoked": false,
+      "revoked_at": null,
+      "role": "deployment_approval",
+      "valid_from": "2026-10-01T00:00:00+00:00",
+      "valid_until": "2027-10-01T00:00:00+00:00"
+    },
+    {
+      "key_id": "runtime-boot-2026-q4",
+      "role": "runtime_boot",
+      "public_key": "release/keys/runtime-boot-2026-q4.pem",
+      "fingerprint": "REPLACE_WITH_SHA256_PUBLIC_KEY_FINGERPRINT",
+      "valid_from": "2026-10-01T00:00:00+00:00",
+      "valid_until": "2027-10-01T00:00:00+00:00",
+      "revoked": false,
+      "revoked_at": null
+    }
+  ],
+  "version": 1
+}

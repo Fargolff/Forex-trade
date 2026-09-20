@@ -1,0 +1,24 @@
+version: 1
+format: forex-auto-trader-watcher-attestation-trust
+keys:
+  - observer_id: watcher-bkk-a
+    key_id: watcher-bkk-a-2026q4
+    public_key: release/watcher_keys/watcher-bkk-a.pem
+    fingerprint: REPLACE_WITH_SHA256_PUBLIC_KEY_FINGERPRINT
+    valid_from: '2026-09-01T00:00:00Z'
+    valid_until: '2027-01-01T00:00:00Z'
+    revoked: false
+  - observer_id: watcher-bkk-b
+    key_id: watcher-bkk-b-2026q4
+    public_key: release/watcher_keys/watcher-bkk-b.pem
+    fingerprint: REPLACE_WITH_SHA256_PUBLIC_KEY_FINGERPRINT
+    valid_from: '2026-09-01T00:00:00Z'
+    valid_until: '2027-01-01T00:00:00Z'
+    revoked: false
+  - observer_id: watcher-sgp-a
+    key_id: watcher-sgp-a-2026q4
+    public_key: release/watcher_keys/watcher-sgp-a.pem
+    fingerprint: REPLACE_WITH_SHA256_PUBLIC_KEY_FINGERPRINT
+    valid_from: '2026-09-01T00:00:00Z'
+    valid_until: '2027-01-01T00:00:00Z'
+    revoked: false

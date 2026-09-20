@@ -4,12 +4,29 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import csv
 import json
+import uuid
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
-from .mt5_broker import BrokerOrder, BrokerPosition, SymbolSpec
+from .mt5_broker import (
+    BrokerOrder,
+    BrokerOrderRejected,
+    BrokerPosition,
+    BrokerSubmissionAmbiguous,
+    ExecutionReceipt,
+    SymbolSpec,
+    normalize_and_validate_protective_prices,
+)
+from .market_clock import WeeklyFxSessionPolicy
+from .session_calibration import (
+    SessionCalibrationConfig,
+    SessionCalibrationStore,
+    clock_watchdog_status,
+    effective_session_policy,
+    observe_market_timing,
+)
 from .ops import (
     HeartbeatStore,
     Incident,
@@ -36,8 +53,27 @@ class LiveEngineConfig:
     max_total_lots: float = 0.05
     max_open_positions: int = 3
     max_spread_pips: float = 2.0
+    allowed_account_logins: tuple[int, ...] = ()
+    require_account_allowlist: bool = False
+    max_margin_fraction_of_equity: float = 0.25
+    min_free_margin_fraction_after_order: float = 0.50
     max_tick_age_seconds: float = 30.0
     max_bar_age_seconds: float = 7200.0
+    market_session_enabled: bool = True
+    market_sunday_open_utc: str = "22:00"
+    market_friday_close_utc: str = "22:00"
+    market_transition_grace_seconds: float = 3600.0
+    max_future_tick_seconds: float = 5.0
+    max_future_bar_seconds: float = 300.0
+    session_calibration_enabled: bool = True
+    session_calibration_state_path: str = "runtime/session_calibration.json"
+    session_calibration_min_samples: int = 3
+    session_calibration_safety_buffer_minutes: int = 15
+    session_calibration_max_narrowing_minutes: int = 180
+    session_calibration_retention_weeks: int = 12
+    clock_watchdog_window_size: int = 12
+    clock_watchdog_min_samples: int = 5
+    max_persistent_clock_offset_seconds: float = 60.0
     deal_reconcile_lookback_hours: float = 72.0
     magic: int = 56001
     deviation_points: int = 20
@@ -49,13 +85,15 @@ class LiveEngineConfig:
 
 @dataclass
 class LiveState:
-    version: int = 2
+    version: int = 4
     peak_equity: float = 0.0
     start_of_day_equity: float = 0.0
     current_day: str | None = None
     last_bar_time: str | None = None
     last_deal_time_msc: int = 0
+    last_deal_ticket: int = 0
     last_incident_fingerprint: str | None = None
+    pending_order_intent: dict[str, Any] | None = None
     halted: bool = False
     halt_reason: str | None = None
 
@@ -142,6 +180,75 @@ def risk_sized_lots(
     return spec.normalize_volume(raw)
 
 
+def broker_risk_sized_lots(
+    broker: Any,
+    symbol: str,
+    equity: float,
+    risk_fraction: float,
+    strategy_weight: float,
+    entry_price: float,
+    stop_loss: float,
+    spec: SymbolSpec,
+    max_lot_per_order: float,
+) -> float:
+    if equity <= 0 or risk_fraction <= 0 or strategy_weight <= 0:
+        return 0.0
+    risk_cash = float(equity) * float(risk_fraction) * float(strategy_weight)
+    loss_per_lot = float(broker.loss_per_lot_to_stop(symbol, 1 if stop_loss < entry_price else -1, entry_price, stop_loss))
+    if loss_per_lot <= 0:
+        return 0.0
+    raw = min(risk_cash / loss_per_lot, float(max_lot_per_order))
+    return spec.normalize_volume(raw)
+
+
+def margin_safety_report(
+    broker: Any,
+    account: Any,
+    symbol: str,
+    side: int,
+    lots: float,
+    price: float,
+    cfg: LiveEngineConfig,
+) -> dict[str, Any]:
+    required = float(broker.order_calc_margin(symbol, side, lots, price))
+    equity = float(account.equity)
+    projected_margin = float(account.margin) + required
+    projected_free = float(account.margin_free) - required
+    margin_fraction = float("inf") if equity <= 0 else projected_margin / equity
+    free_fraction = float("-inf") if equity <= 0 else projected_free / equity
+    checks = {
+        "required_margin_nonnegative": required >= 0,
+        "projected_margin_within_cap": margin_fraction <= cfg.max_margin_fraction_of_equity + 1e-12,
+        "projected_free_margin_positive": projected_free > 0,
+        "projected_free_margin_fraction": free_fraction + 1e-12 >= cfg.min_free_margin_fraction_after_order,
+    }
+    return {
+        "ok": all(checks.values()),
+        "checks": checks,
+        "required_margin": required,
+        "projected_margin": projected_margin,
+        "projected_free_margin": projected_free,
+        "projected_margin_fraction": margin_fraction,
+        "projected_free_margin_fraction": free_fraction,
+    }
+
+
+def execution_receipt_issue(
+    receipt: ExecutionReceipt,
+    requested_volume: float,
+    volume_tolerance: float,
+) -> str | None:
+    if receipt.status == "PARTIAL":
+        return "PARTIAL_FILL"
+    if receipt.status == "PLACED":
+        return "ORDER_ACCEPTED_UNCONFIRMED"
+    if receipt.status != "FILLED":
+        return "ORDER_STATUS_UNKNOWN"
+    if abs(float(receipt.filled_volume) - float(requested_volume)) > max(float(volume_tolerance), 1e-12):
+        return "FILL_VOLUME_MISMATCH"
+    return None
+
+
 def _strategy_name(position: BrokerPosition) -> str | None:
     if not position.comment.startswith(COMMENT_PREFIX):
         return None
@@ -156,11 +263,15 @@ def preflight_report(broker: Any, symbol: str, cfg: LiveEngineConfig, live_enabl
     managed = broker.open_positions(symbol=symbol, magic=cfg.magic)
     current_spread = spread_pips(tick, spec)
     total_lots = sum(float(p.volume) for p in managed)
+    account_allowed = (not cfg.require_account_allowlist) or (
+        bool(cfg.allowed_account_logins) and int(account.login) in set(cfg.allowed_account_logins)
+    )
     checks = {
         "config_live_enabled": bool(live_enabled),
         "terminal_connected": bool(terminal.connected),
         "terminal_trade_allowed": bool(terminal.trade_allowed),
         "hedging_account": bool(account.hedging),
+        "account_login_allowed": account_allowed,
         "symbol_trade_allowed": bool(spec.trade_allowed),
         "tick_value_available": spec.tick_size > 0 and spec.tick_value > 0,
         "spread_within_cap": current_spread <= cfg.max_spread_pips,
@@ -219,12 +330,99 @@ class LiveTradingEngine:
         self.events = LiveEventLog(config.events_path)
         self.incidents = IncidentLog(config.incidents_path)
         self.heartbeat = HeartbeatStore(config.heartbeat_path)
+        self.session_calibration_config = SessionCalibrationConfig(
+            enabled=config.session_calibration_enabled,
+            state_path=config.session_calibration_state_path,
+            min_boundary_samples=config.session_calibration_min_samples,
+            safety_buffer_minutes=config.session_calibration_safety_buffer_minutes,
+            max_narrowing_minutes=config.session_calibration_max_narrowing_minutes,
+            sample_retention_weeks=config.session_calibration_retention_weeks,
+            clock_window_size=config.clock_watchdog_window_size,
+            clock_min_samples=config.clock_watchdog_min_samples,
+            max_persistent_clock_offset_seconds=config.max_persistent_clock_offset_seconds,
+        )
+        self.session_calibration_store = SessionCalibrationStore(config.session_calibration_state_path)
+        self.session_calibration_state = self.session_calibration_store.load()
         self.state = self.store.load()
         self.limits = RiskLimits(
             risk_per_trade=config.risk_per_trade,
             max_daily_loss_pct=config.max_daily_loss_pct,
             max_drawdown_pct=config.max_drawdown_pct,
         )
+
+    def _persist_order_intent(
+        self,
+        ts: pd.Timestamp | datetime,
+        *,
+        action: str,
+        strategy: str,
+        side: int,
+        lots: float,
+        stop_loss: float = 0.0,
+        take_profit: float = 0.0,
+        position_ticket: int = 0,
+        position_id: int = 0,
+    ) -> dict[str, Any]:
+        intent = {
+            "version": 3,
+            "intent_id": uuid.uuid4().hex,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "deal_cursor_before_submit": {
+                "time_msc": int(self.state.last_deal_time_msc),
+                "ticket": int(self.state.last_deal_ticket),
+            },
+            "action": action,
+            "strategy": strategy,
+            "symbol": self.symbol,
+            "magic": int(self.config.magic),
+            "side": int(side),
+            "lots": float(lots),
+            "stop_loss": float(stop_loss),
+            "take_profit": float(take_profit),
+            "position_ticket": int(position_ticket),
+            "position_id": int(position_id or position_ticket),
+            "bar_time": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
+        }
+        self.state.pending_order_intent = intent
+        self.store.save(self.state)
+        return intent
+
+
+    def _persist_execution_receipt(self, receipt: ExecutionReceipt) -> None:
+        if self.state.pending_order_intent is None:
+            return
+        intent = dict(self.state.pending_order_intent)
+        intent["broker_receipt_status"] = str(receipt.status)
+        intent["broker_retcode"] = int(receipt.retcode)
+        intent["broker_order_ticket"] = int(receipt.order)
+        intent["broker_deal_ticket"] = int(receipt.deal)
+        intent["broker_requested_volume"] = float(receipt.requested_volume)
+        intent["broker_filled_volume"] = float(receipt.filled_volume)
+        intent["broker_receipt_price"] = float(receipt.price)
+        self.state.pending_order_intent = intent
+        # Persist broker acknowledgement before interpreting PLACED/PARTIAL.
+        # A crash after this save can be reconciled by exact broker order ticket.
+        self.store.save(self.state)
+
+    def _clear_order_intent(self) -> None:
+        self.state.pending_order_intent = None
+        self.store.save(self.state)
+
+    def _execution_fail_closed(
+        self,
+        ts: pd.Timestamp | datetime,
+        code: str,
+        detail: str,
+        *,
+        strategy: str = "",
+        ticket: int = 0,
+    ) -> None:
+        incident = Incident(code=code, severity="CRITICAL", detail=detail, strategy=strategy, ticket=ticket)
+        self._record_incidents([incident], ts)
+        if not self.state.halted:
+            self._halt_for_ops(pd.Timestamp(ts), [incident])
+        else:
+            self.store.save(self.state)
 
     def _managed_positions(self) -> list[BrokerPosition]:
         return self.broker.open_positions(symbol=self.symbol, magic=self.config.magic)
@@ -258,7 +456,27 @@ class LiveTradingEngine:
             )
 
     def _operational_report(self, ts: pd.Timestamp) -> dict[str, Any]:
-        return operational_report(
+        static_policy = WeeklyFxSessionPolicy(
+            enabled=self.config.market_session_enabled,
+            sunday_open_utc=self.config.market_sunday_open_utc,
+            friday_close_utc=self.config.market_friday_close_utc,
+            transition_grace_seconds=self.config.market_transition_grace_seconds,
+            max_future_tick_seconds=self.config.max_future_tick_seconds,
+            max_future_bar_seconds=self.config.max_future_bar_seconds,
+        )
+        observed_tick = self.broker.current_tick(self.symbol)
+        observe_market_timing(
+            self.session_calibration_state,
+            tick_time_msc=observed_tick.time_msc,
+            static_policy=static_policy,
+            config=self.session_calibration_config,
+        )
+        self.session_calibration_store.save(self.session_calibration_state)
+        policy, calibration = effective_session_policy(
+            static_policy, self.session_calibration_state, self.session_calibration_config
+        )
+        clock_watchdog = clock_watchdog_status(self.session_calibration_state, self.session_calibration_config)
+        report = operational_report(
             self.broker,
             self.symbol,
             self.config.magic,
@@ -266,11 +484,30 @@ class LiveTradingEngine:
             ts,
             max_tick_age_seconds=self.config.max_tick_age_seconds,
             max_bar_age_seconds=self.config.max_bar_age_seconds,
+            market_session_enabled=policy.enabled,
+            market_sunday_open_utc=policy.sunday_open_utc,
+            market_friday_close_utc=policy.friday_close_utc,
+            market_transition_grace_seconds=policy.transition_grace_seconds,
+            max_future_tick_seconds=policy.max_future_tick_seconds,
+            max_future_bar_seconds=policy.max_future_bar_seconds,
         )
+        if clock_watchdog["violation"]:
+            report["incidents"].append(
+                Incident(
+                    "PERSISTENT_BROKER_TIME_OFFSET",
+                    "CRITICAL",
+                    f"rolling broker/host offset median {float(clock_watchdog['median_offset_seconds']):.1f}s "
+                    f"exceeds {float(clock_watchdog['threshold_seconds']):.1f}s; investigate OS clock or feed latency",
+                )
+            )
+            report["status"] = "CRITICAL"
+            report["ok"] = False
+        report["session_calibration"] = calibration
+        report["clock_watchdog"] = clock_watchdog
+        return report
 
     def _write_heartbeat(self, report: dict[str, Any], status: str | None = None) -> None:
-        self.heartbeat.write(
-            heartbeat_payload(
+        payload = heartbeat_payload(
                 status=status or report["status"],
                 symbol=self.symbol,
                 last_bar_time=self.state.last_bar_time,
@@ -280,9 +517,18 @@ class LiveTradingEngine:
                 spread_pips=report["spread_pips"],
                 tick_age_seconds_value=report["tick_age_seconds"],
                 bar_age_seconds_value=report["bar_age_seconds"],
+                market_state=report.get("market_state"),
+                market_reason=report.get("market_reason"),
+                next_market_transition_utc=report.get("next_market_transition_utc"),
+                staleness_suppressed=bool(report.get("staleness_suppressed", False)),
+                tick_clock_offset_seconds_value=report.get("tick_clock_offset_seconds"),
+                bar_clock_offset_seconds_value=report.get("bar_clock_offset_seconds"),
                 last_deal_time_msc=self.state.last_deal_time_msc,
+                last_deal_ticket=self.state.last_deal_ticket,
             )
-        )
+        payload["session_calibration"] = report.get("session_calibration")
+        payload["clock_watchdog"] = report.get("clock_watchdog")
+        self.heartbeat.write(payload)
 
     def _reconcile_deals(self, ts: pd.Timestamp | datetime) -> dict[str, float | int]:
         deals = recent_managed_deals(
@@ -290,6 +536,7 @@ class LiveTradingEngine:
             self.symbol,
             self.config.magic,
             after_time_msc=self.state.last_deal_time_msc,
+            after_ticket=self.state.last_deal_ticket,
             lookback_hours=self.config.deal_reconcile_lookback_hours,
         )
         for deal in deals:
@@ -311,7 +558,9 @@ class LiveTradingEngine:
                 ),
             )
         if deals:
-            self.state.last_deal_time_msc = max(item.time_msc for item in deals)
+            latest = max((int(item.time_msc), int(item.ticket)) for item in deals)
+            self.state.last_deal_time_msc = latest[0]
+            self.state.last_deal_ticket = latest[1]
         return deal_totals(deals)
 
     def _risk_gate(self, ts: pd.Timestamp) -> tuple[bool, str | None]:
@@ -335,25 +584,62 @@ class LiveTradingEngine:
         closed: list[int] = []
         now = datetime.now(timezone.utc)
         for position in list(self._managed_positions()):
-            self.broker.close_position(
-                position,
-                deviation_points=self.config.deviation_points,
-                live_enabled=self.live_enabled,
+            strategy = _strategy_name(position) or ""
+            self._persist_order_intent(
+                now, action="FLATTEN", strategy=strategy, side=-position.side,
+                lots=position.volume, position_ticket=position.ticket,
+                position_id=int(getattr(position, "identifier", 0) or position.ticket),
             )
+            try:
+                receipt = self.broker.close_position(
+                    position,
+                    deviation_points=self.config.deviation_points,
+                    live_enabled=self.live_enabled,
+                )
+            except BrokerOrderRejected as exc:
+                self._clear_order_intent()
+                self._execution_fail_closed(
+                    now, "EMERGENCY_CLOSE_REJECTED", str(exc), strategy=strategy, ticket=position.ticket
+                )
+                raise
+            except BrokerSubmissionAmbiguous as exc:
+                self._execution_fail_closed(
+                    now, "EMERGENCY_CLOSE_AMBIGUOUS", str(exc), strategy=strategy, ticket=position.ticket
+                )
+                raise
+            except Exception as exc:
+                self._execution_fail_closed(
+                    now, "EMERGENCY_CLOSE_EXCEPTION", str(exc), strategy=strategy, ticket=position.ticket
+                )
+                raise
+
+            self._persist_execution_receipt(receipt)
+            issue = execution_receipt_issue(
+                receipt, position.volume, max(self.broker.symbol_spec(position.symbol).volume_step / 2.0, 1e-12)
+            )
+            if issue:
+                self._execution_fail_closed(
+                    now, issue,
+                    f"emergency close status={receipt.status}; requested={position.volume}; filled={receipt.filled_volume}",
+                    strategy=strategy, ticket=receipt.ticket or position.ticket,
+                )
+                raise RuntimeError(f"emergency flatten not fully confirmed: {issue}")
+
             closed.append(position.ticket)
             self._log(
                 "FLATTEN",
                 now,
-                strategy=_strategy_name(position) or "",
+                strategy=strategy,
                 side=position.side,
-                lots=position.volume,
-                price="",
+                lots=receipt.filled_volume,
+                price=receipt.price or "",
                 stop_loss=position.stop_loss,
                 take_profit=position.take_profit,
                 spread_pips="",
-                ticket=position.ticket,
-                reason=reason,
+                ticket=receipt.ticket or position.ticket,
+                reason=f"{reason};deal={receipt.deal}",
             )
+            self._clear_order_intent()
         return closed
 
     def _halt_and_flatten(self, ts: pd.Timestamp, reason: str) -> None:
@@ -412,6 +698,26 @@ class LiveTradingEngine:
         self._record_incidents(report["incidents"], ts)
         self._reconcile_deals(ts)
 
+        if self.state.pending_order_intent is not None:
+            pending = self.state.pending_order_intent
+            incident = Incident(
+                code="PENDING_ORDER_INTENT",
+                severity="CRITICAL",
+                detail=(
+                    f"unresolved {pending.get('action', 'ORDER')} intent for "
+                    f"{pending.get('strategy', '')} lots={pending.get('lots', '')}; "
+                    "inspect broker positions/deals before clearing the intent"
+                ),
+                strategy=str(pending.get("strategy", "")),
+                ticket=int(pending.get("position_ticket", 0) or 0),
+            )
+            self._record_incidents([incident], ts)
+            if not self.state.halted:
+                self._halt_for_ops(ts, [incident])
+            self.store.save(self.state)
+            self._write_heartbeat(report, status="HALTED")
+            return self.snapshot()
+
         critical = [item for item in report["incidents"] if item.severity == "CRITICAL"]
         if critical and not self.state.halted:
             self._halt_for_ops(ts, critical)
@@ -423,6 +729,14 @@ class LiveTradingEngine:
         if self.state.halted:
             self.store.save(self.state)
             self._write_heartbeat(report, status="HALTED")
+            return self.snapshot()
+
+        if report.get("market_state", "OPEN") != "OPEN":
+            # Weekend / configured boundary windows are not feed failures, but
+            # they are also not permitted entry windows. Keep last_bar_time
+            # unchanged so a fresh completed bar is required after reopening.
+            self.store.save(self.state)
+            self._write_heartbeat(report, status="OK")
             return self.snapshot()
 
         warnings = [item for item in report["incidents"] if item.severity == "WARN"]
@@ -494,26 +808,76 @@ class LiveTradingEngine:
             if existing is not None and existing.side == side:
                 continue
             if existing is not None and existing.side != side:
-                self.broker.close_position(
-                    existing,
-                    deviation_points=self.config.deviation_points,
-                    live_enabled=self.live_enabled,
+                self._persist_order_intent(
+                    ts,
+                    action="CLOSE",
+                    strategy=strategy,
+                    side=-existing.side,
+                    lots=existing.volume,
+                    position_ticket=existing.ticket,
+                    position_id=int(getattr(existing, "identifier", 0) or existing.ticket),
                 )
-                total_lots = max(0.0, total_lots - existing.volume)
-                open_count = max(0, open_count - 1)
+                try:
+                    close_receipt = self.broker.close_position(
+                        existing,
+                        deviation_points=self.config.deviation_points,
+                        live_enabled=self.live_enabled,
+                    )
+                except BrokerOrderRejected as exc:
+                    self._clear_order_intent()
+                    self._log(
+                        "CLOSE_REJECT", ts, strategy=strategy, side=existing.side, lots=existing.volume,
+                        price="", stop_loss=existing.stop_loss, take_profit=existing.take_profit,
+                        spread_pips=current_spread, ticket=existing.ticket, reason=str(exc),
+                    )
+                    continue
+                except BrokerSubmissionAmbiguous as exc:
+                    self._execution_fail_closed(
+                        ts, "CLOSE_SUBMISSION_AMBIGUOUS", str(exc), strategy=strategy, ticket=existing.ticket
+                    )
+                    self._write_heartbeat(report, status="HALTED")
+                    return self.snapshot()
+                except Exception as exc:
+                    self._execution_fail_closed(
+                        ts, "CLOSE_EXECUTION_EXCEPTION", str(exc), strategy=strategy, ticket=existing.ticket
+                    )
+                    self._write_heartbeat(report, status="HALTED")
+                    return self.snapshot()
+
+                self._persist_execution_receipt(close_receipt)
+                close_issue = execution_receipt_issue(
+                    close_receipt, existing.volume, max(spec.volume_step / 2.0, 1e-12)
+                )
+                if close_issue:
+                    self._execution_fail_closed(
+                        ts,
+                        close_issue,
+                        (
+                            f"close status={close_receipt.status}; requested={existing.volume}; "
+                            f"filled={close_receipt.filled_volume}; order={close_receipt.order}; deal={close_receipt.deal}"
+                        ),
+                        strategy=strategy,
+                        ticket=close_receipt.ticket or existing.ticket,
+                    )
+                    self._write_heartbeat(report, status="HALTED")
+                    return self.snapshot()
+
                 self._log(
                     "CLOSE",
                     ts,
                     strategy=strategy,
                     side=existing.side,
-                    lots=existing.volume,
-                    price="",
+                    lots=close_receipt.filled_volume,
+                    price=close_receipt.price or "",
                     stop_loss=existing.stop_loss,
                     take_profit=existing.take_profit,
                     spread_pips=current_spread,
-                    ticket=existing.ticket,
-                    reason="opposite_signal",
+                    ticket=close_receipt.ticket or existing.ticket,
+                    reason=f"opposite_signal;deal={close_receipt.deal}",
                 )
+                self._clear_order_intent()
+                total_lots = max(0.0, total_lots - close_receipt.filled_volume)
+                open_count = max(0, open_count - 1)
 
             if current_spread > self.config.max_spread_pips:
                 self._log(
@@ -548,14 +912,40 @@ class LiveTradingEngine:
 
             stop_distance = float(row["stop_distance"])
             tp_distance = float(row["take_profit_distance"])
-            lots = risk_sized_lots(
-                account.equity,
-                self.config.risk_per_trade,
-                self.weights[strategy],
-                stop_distance,
-                spec,
-                self.config.max_lot_per_order,
-            )
+            tick = self.broker.current_tick(self.symbol)
+            market_price = tick.ask if side > 0 else tick.bid
+            raw_stop = market_price - side * stop_distance
+            raw_take = market_price + side * tp_distance
+            try:
+                market_price, stop_loss, take_profit = normalize_and_validate_protective_prices(
+                    spec, side, market_price, raw_stop, raw_take
+                )
+                lots = broker_risk_sized_lots(
+                    self.broker,
+                    self.symbol,
+                    account.equity,
+                    self.config.risk_per_trade,
+                    self.weights[strategy],
+                    market_price,
+                    stop_loss,
+                    spec,
+                    self.config.max_lot_per_order,
+                )
+            except Exception as exc:
+                self._log(
+                    "REJECT",
+                    ts,
+                    strategy=strategy,
+                    side=side,
+                    lots=0.0,
+                    price=market_price,
+                    stop_loss=raw_stop,
+                    take_profit=raw_take,
+                    spread_pips=current_spread,
+                    ticket="",
+                    reason=f"broker_risk_or_protection:{exc}",
+                )
+                continue
             if lots <= 0:
                 self._log(
                     "REJECT",
@@ -563,9 +953,9 @@ class LiveTradingEngine:
                     strategy=strategy,
                     side=side,
                     lots=0.0,
-                    price="",
-                    stop_loss="",
-                    take_profit="",
+                    price=market_price,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
                     spread_pips=current_spread,
                     ticket="",
                     reason="position_size_zero",
@@ -578,19 +968,50 @@ class LiveTradingEngine:
                     strategy=strategy,
                     side=side,
                     lots=lots,
-                    price="",
-                    stop_loss="",
-                    take_profit="",
+                    price=market_price,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
                     spread_pips=current_spread,
                     ticket="",
                     reason="total_lot_cap",
                 )
                 continue
+            try:
+                margin = margin_safety_report(
+                    self.broker, account, self.symbol, side, lots, market_price, self.config
+                )
+            except Exception as exc:
+                self._log(
+                    "REJECT",
+                    ts,
+                    strategy=strategy,
+                    side=side,
+                    lots=lots,
+                    price=market_price,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    spread_pips=current_spread,
+                    ticket="",
+                    reason=f"broker_margin_calc_failed:{exc}",
+                )
+                continue
+            if not margin["ok"]:
+                failed = ",".join(name for name, passed in margin["checks"].items() if not passed)
+                self._log(
+                    "REJECT",
+                    ts,
+                    strategy=strategy,
+                    side=side,
+                    lots=lots,
+                    price=market_price,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    spread_pips=current_spread,
+                    ticket="",
+                    reason=f"margin_gate:{failed};required={margin['required_margin']:.2f}",
+                )
+                continue
 
-            tick = self.broker.current_tick(self.symbol)
-            market_price = tick.ask if side > 0 else tick.bid
-            stop_loss = round(market_price - side * stop_distance, spec.digits)
-            take_profit = round(market_price + side * tp_distance, spec.digits)
             order = BrokerOrder(
                 symbol=self.symbol,
                 side=side,
@@ -601,22 +1022,72 @@ class LiveTradingEngine:
                 deviation_points=self.config.deviation_points,
                 comment=f"{COMMENT_PREFIX}{strategy}"[:31],
             )
-            result = self.broker.market_order(order, live_enabled=self.live_enabled)
-            ticket = int(getattr(result, "order", 0) or getattr(result, "deal", 0) or 0)
+            self._persist_order_intent(
+                ts,
+                action="ENTRY",
+                strategy=strategy,
+                side=side,
+                lots=lots,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+            )
+            try:
+                receipt = self.broker.market_order(order, live_enabled=self.live_enabled)
+            except BrokerOrderRejected as exc:
+                self._clear_order_intent()
+                self._log(
+                    "REJECT", ts, strategy=strategy, side=side, lots=lots, price=market_price,
+                    stop_loss=stop_loss, take_profit=take_profit, spread_pips=current_spread,
+                    ticket="", reason=f"broker_reject:{exc}",
+                )
+                continue
+            except BrokerSubmissionAmbiguous as exc:
+                self._execution_fail_closed(
+                    ts, "ORDER_SUBMISSION_AMBIGUOUS", str(exc), strategy=strategy
+                )
+                self._write_heartbeat(report, status="HALTED")
+                return self.snapshot()
+            except Exception as exc:
+                self._execution_fail_closed(
+                    ts, "ORDER_EXECUTION_EXCEPTION", str(exc), strategy=strategy
+                )
+                self._write_heartbeat(report, status="HALTED")
+                return self.snapshot()
+
+            self._persist_execution_receipt(receipt)
+            issue = execution_receipt_issue(receipt, lots, max(spec.volume_step / 2.0, 1e-12))
+            if issue:
+                self._execution_fail_closed(
+                    ts,
+                    issue,
+                    (
+                        f"entry status={receipt.status}; requested={lots}; filled={receipt.filled_volume}; "
+                        f"order={receipt.order}; deal={receipt.deal}"
+                    ),
+                    strategy=strategy,
+                    ticket=receipt.ticket,
+                )
+                self._write_heartbeat(report, status="HALTED")
+                return self.snapshot()
+
             self._log(
                 "ENTRY",
                 ts,
                 strategy=strategy,
                 side=side,
-                lots=lots,
-                price=market_price,
+                lots=receipt.filled_volume,
+                price=receipt.price or market_price,
                 stop_loss=stop_loss,
                 take_profit=take_profit,
                 spread_pips=current_spread,
-                ticket=ticket,
-                reason="latest_completed_bar_signal",
+                ticket=receipt.ticket,
+                reason=f"latest_completed_bar_signal;deal={receipt.deal};retcode={receipt.retcode}",
             )
-            total_lots += lots
+            # Clear only after the durable ENTRY audit row exists. If the process
+            # dies after broker submission but before here, restart sees the
+            # pending intent and refuses to resend.
+            self._clear_order_intent()
+            total_lots += receipt.filled_volume
             open_count += 1
 
         self.state.last_bar_time = ts.isoformat()
@@ -642,6 +1113,8 @@ class LiveTradingEngine:
             "halt_reason": self.state.halt_reason,
             "last_bar_time": self.state.last_bar_time,
             "last_deal_time_msc": self.state.last_deal_time_msc,
+            "last_deal_ticket": self.state.last_deal_ticket,
+            "pending_order_intent_id": (self.state.pending_order_intent or {}).get("intent_id"),
             "managed_positions": len(managed),
             "managed_total_lots": sum(float(p.volume) for p in managed),
             "heartbeat_path": self.config.heartbeat_path,
